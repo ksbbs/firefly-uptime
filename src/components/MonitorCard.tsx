@@ -45,14 +45,39 @@ function getStatusConfig(status: number) {
   }
 }
 
+function UptimeBadge({ value, label }: { value: number; label: string }) {
+  const isPerfect = value >= 100;
+  const isGood = value >= 99;
+  return (
+    <div className="text-center">
+      <p
+        className={`text-xs font-semibold tabular-nums ${
+          isPerfect
+            ? "text-up"
+            : isGood
+              ? "text-paused"
+              : "text-down"
+        }`}
+      >
+        {value.toFixed(2)}%
+      </p>
+      <p className="text-text-muted text-[10px]">{label}</p>
+    </div>
+  );
+}
+
 export default function MonitorCard({ monitor }: MonitorCardProps) {
   const config = getStatusConfig(monitor.status);
-  const isDown = monitor.status === MONITOR_STATUS.DOWN || monitor.status === MONITOR_STATUS.SEEMS_DOWN;
+  const isDown =
+    monitor.status === MONITOR_STATUS.DOWN ||
+    monitor.status === MONITOR_STATUS.SEEMS_DOWN;
+  const downCount = monitor.downEvents.length;
 
   return (
     <div
       className={`rounded-2xl bg-bg-card border border-border hover:border-accent/20 p-5 transition-all duration-300 hover:shadow-lg hover:shadow-accent-glow hover:-translate-y-0.5 animate-fade-in`}
     >
+      {/* Header: Name + Status */}
       <div className="flex items-start justify-between mb-4">
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2.5 mb-1">
@@ -73,15 +98,14 @@ export default function MonitorCard({ monitor }: MonitorCardProps) {
           className={`px-2.5 py-1 rounded-full text-xs font-medium ${config.bg} ${config.text} ${config.border} border whitespace-nowrap`}
         >
           <span className="flex items-center gap-1">
-            {isDown && (
-              <span className="animate-status-pulse">●</span>
-            )}
+            {isDown && <span className="animate-status-pulse">●</span>}
             {monitor.statusLabel}
           </span>
         </div>
       </div>
 
-      <div className="grid grid-cols-3 gap-4 mb-4">
+      {/* Metrics Row */}
+      <div className="grid grid-cols-3 gap-3 mb-4">
         <div>
           <p className="text-text-muted text-xs mb-0.5">响应时间</p>
           <p className="text-text-primary text-sm font-semibold tabular-nums">
@@ -91,32 +115,55 @@ export default function MonitorCard({ monitor }: MonitorCardProps) {
           </p>
         </div>
         <div>
-          <p className="text-text-muted text-xs mb-0.5">7 天 uptime</p>
+          <p className="text-text-muted text-xs mb-0.5">宕机次数</p>
           <p
             className={`text-sm font-semibold tabular-nums ${
-              monitor.uptimeRatio < 100 ? "text-down" : "text-up"
+              downCount > 0 ? "text-down" : "text-up"
             }`}
           >
-            {monitor.uptimeRatio.toFixed(2)}%
+            {downCount > 0 ? `${downCount} 次` : "0 次"}
           </p>
         </div>
         <div>
-          <p className="text-text-muted text-xs mb-0.5">状态</p>
-          <div className="flex items-center gap-1.5">
-            <span className="text-text-primary text-sm font-semibold">
-              {monitor.logs.filter(l => l.type === 2).length > 0
-                ? `${monitor.logs.filter(l => l.type === 2).length} 次`
-                : "无事件"}
-            </span>
-          </div>
+          <p className="text-text-muted text-xs mb-0.5">最后检查</p>
+          <p className="text-text-primary text-sm font-semibold tabular-nums">
+            {monitor.responseTimes.length > 0
+              ? `${monitor.responseTimes[monitor.responseTimes.length - 1].value}ms`
+              : "-"}
+          </p>
         </div>
       </div>
 
-      <div className="pt-3 border-t border-border">
+      {/* Uptime Badges: 7d | 30d | 90d */}
+      <div className="grid grid-cols-3 gap-2 mb-4 p-3 rounded-xl bg-bg-primary/50 border border-border/50">
+        <UptimeBadge
+          value={monitor.uptimeRatios.ratio7d}
+          label="过去 7 天"
+        />
+        <UptimeBadge
+          value={monitor.uptimeRatios.ratio30d}
+          label="过去 30 天"
+        />
+        <UptimeBadge
+          value={monitor.uptimeRatios.ratio90d}
+          label="过去 90 天"
+        />
+      </div>
+
+      {/* Mini History Bar */}
+      <div className="pt-2">
         <div className="flex items-center justify-between mb-2">
           <span className="text-text-muted text-xs">最近 7 天趋势</span>
-          <span className="text-text-muted text-xs">
-            {monitor.uptimeRatio.toFixed(2)}%
+          <span
+            className={`text-xs font-medium ${
+              monitor.uptimeRatios.ratio7d >= 100
+                ? "text-up"
+                : monitor.uptimeRatios.ratio7d >= 99
+                  ? "text-paused"
+                  : "text-down"
+            }`}
+          >
+            {monitor.uptimeRatios.ratio7d.toFixed(2)}%
           </span>
         </div>
         <MiniHistoryBar logs={monitor.logs} days={7} />

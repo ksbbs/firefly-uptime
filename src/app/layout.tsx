@@ -27,7 +27,7 @@ export default function RootLayout({
           <p>
             Powered by{" "}
             <a
-              href="https://uptimerobot.com"
+              href="https://dashboard.uptimerobot.com/"
               target="_blank"
               rel="noopener noreferrer"
               className="text-accent hover:underline"

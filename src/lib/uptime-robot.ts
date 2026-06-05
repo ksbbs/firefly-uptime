@@ -4,9 +4,33 @@ import type {
   FormattedMonitor,
   Incident,
   MonitorLog,
+  UptimeRatios,
 } from "./types";
+import { LOG_TYPE } from "./types";
 
 const API_BASE = "https://api.uptimerobot.com/v2";
+
+function toNum(val: unknown, fallback = 0): number {
+  if (typeof val === "number") return val;
+  if (typeof val === "string") {
+    const n = parseFloat(val);
+    return isNaN(n) ? fallback : n;
+  }
+  return fallback;
+}
+
+/** Parse Uptime Robot custom_uptime_ranges like "99.98-97.50-95.00" into separate periods */
+function parseUptimeRanges(ranges?: string): UptimeRatios {
+  const parts = (ranges || "")
+    .split("-")
+    .filter(Boolean)
+    .map((s) => toNum(s));
+  return {
+    ratio7d: parts[0] ?? 100,
+    ratio30d: parts[1] ?? 100,
+    ratio90d: parts[2] ?? 100,
+  };
+}
 
 export async function fetchMonitors(
   apiKey: string
@@ -23,7 +47,7 @@ export async function fetchMonitors(
       logs: "1",
       log_types: "1-2",
       log_date_start: String(
-        Math.floor((Date.now() - 30 * 24 * 60 * 60 * 1000) / 1000)
+        Math.floor((Date.now() - 90 * 24 * 60 * 60 * 1000) / 1000)
       ),
       custom_uptime_ratios: "7-30-90",
       response_times: "1",
@@ -48,15 +72,6 @@ export async function fetchMonitors(
   return (data.monitors || []).map(formatMonitor);
 }
 
-function toNum(val: unknown, fallback = 0): number {
-  if (typeof val === "number") return val;
-  if (typeof val === "string") {
-    const n = parseFloat(val);
-    return isNaN(n) ? fallback : n;
-  }
-  return fallback;
-}
-
 function formatMonitor(monitor: UptimeRobotMonitor): FormattedMonitor {
   const statusLabels: Record<number, string> = {
     0: "Paused",
@@ -66,8 +81,8 @@ function formatMonitor(monitor: UptimeRobotMonitor): FormattedMonitor {
     9: "Down",
   };
 
-  const logs = (monitor.logs || []).filter(
-    (log: MonitorLog) => log.type === 1 || log.type === 2
+  const allLogs = (monitor.logs || []).filter(
+    (log: MonitorLog) => log.type === LOG_TYPE.DOWN || log.type === LOG_TYPE.UP
   );
 
   return {
@@ -76,14 +91,15 @@ function formatMonitor(monitor: UptimeRobotMonitor): FormattedMonitor {
     url: monitor.url,
     status: monitor.status,
     statusLabel: statusLabels[monitor.status] || "Unknown",
-    uptimeRatio: toNum(monitor.custom_uptime_ratio, 100),
+    uptimeRatios: parseUptimeRanges(monitor.custom_uptime_ranges),
     averageResponseTime: toNum(monitor.average_response_time),
-    logs,
+    logs: allLogs,
     responseTimes: (monitor.response_times || []).map((rt) => ({
       datetime: rt.datetime,
       value: toNum(rt.value),
     })),
-    incidents: logs.filter((log: MonitorLog) => log.type === 2),
+    /** DOWN events = incidents */
+    downEvents: allLogs.filter((log: MonitorLog) => log.type === LOG_TYPE.DOWN),
   };
 }
 
@@ -113,7 +129,7 @@ export function getIncidents(monitors: FormattedMonitor[]): Incident[] {
   const incidents: Incident[] = [];
 
   for (const monitor of monitors) {
-    for (const log of monitor.incidents) {
+    for (const log of monitor.downEvents) {
       const now = Math.floor(Date.now() / 1000);
       incidents.push({
         id: log.id,

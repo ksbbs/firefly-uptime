@@ -46,6 +46,11 @@ export interface MonitorLog {
   duration: number;
 }
 
+export const LOG_TYPE = {
+  DOWN: 1,
+  UP: 2,
+} as const;
+
 export interface UptimeRobotMonitor {
   id: number;
   friendly_name: string;
@@ -78,17 +83,24 @@ export interface UptimeRobotResponse {
   };
 }
 
+export interface UptimeRatios {
+  ratio7d: number;
+  ratio30d: number;
+  ratio90d: number;
+}
+
 export interface FormattedMonitor {
   id: number;
   name: string;
   url: string;
   status: MonitorStatus;
   statusLabel: string;
-  uptimeRatio: number;
+  uptimeRatios: UptimeRatios;
   averageResponseTime: number;
   logs: MonitorLog[];
   responseTimes: { datetime: number; value: number }[];
-  incidents: MonitorLog[];
+  /** DOWN events (log type === 1) */
+  downEvents: MonitorLog[];
 }
 
 export interface Incident {
