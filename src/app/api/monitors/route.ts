@@ -20,6 +20,17 @@ export async function GET() {
     const monitors = jwt
       ? await fetchMonitors(jwt, true) // v3
       : await fetchMonitors(apiKey!, false); // v2 降级
+
+    // 诊断日志：验证 uptime 比率数据是否正确获取
+    if (monitors.length > 0) {
+      const firstMonitor = monitors[0];
+      console.log(
+        `[DIAG] uptimeRatios for "${firstMonitor.name}":`,
+        JSON.stringify(firstMonitor.uptimeRatios),
+        `downEvents: ${firstMonitor.downEvents.length}`
+      );
+    }
+
     const overall = getOverallStatus(monitors);
     const incidents = getIncidents(monitors);
 

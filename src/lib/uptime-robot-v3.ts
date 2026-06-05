@@ -66,7 +66,7 @@ function formatMonitor(monitor: V3Monitor): FormattedMonitor {
     statusLabel: monitor.status === "up" ? "Up" : monitor.status === "down" ? "Down" : "Paused",
     monitorType: monitor.type,
     interval: monitor.interval,
-    uptimeRatios: parseUptimeRanges(monitor.custom_uptime_ranges),
+    uptimeRatios: parseUptimeRanges(monitor.custom_uptime_ratios),
     averageResponseTime: toNum(monitor.average_response_time),
     logs: allLogs,
     responseTimes,

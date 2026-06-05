@@ -108,6 +108,7 @@ export interface V3Monitor {
   create_datetime: string;
   logs?: V3MonitorLog[];
   custom_uptime_ratio?: number;
+  custom_uptime_ratios?: string;
   custom_uptime_ranges?: string;
   average_response_time?: number;
   response_times?: V3ResponseTime[];
