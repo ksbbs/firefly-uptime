@@ -23,8 +23,18 @@ export async function GET() {
     const overall = getOverallStatus(monitors);
     const incidents = getIncidents(monitors);
 
+    // 剥离敏感字段（IP、URL、端口等）后再返回客户端
+    const sanitizedMonitors = monitors.map((m) => {
+      const { url: _url, ...rest } = m;
+      return rest;
+    });
+    const sanitizedIncidents = incidents.map((inc) => ({
+      ...inc,
+      monitorUrl: "",
+    }));
+
     return NextResponse.json(
-      { monitors, overall, incidents },
+      { monitors: sanitizedMonitors, overall, incidents: sanitizedIncidents },
       {
         headers: {
           "Access-Control-Allow-Origin": "*",

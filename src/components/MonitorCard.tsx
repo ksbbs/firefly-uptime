@@ -92,7 +92,7 @@ export default function MonitorCard({ monitor, onClick }: MonitorCardProps) {
           </div>
           {monitor.url && (
             <p className="text-text-muted text-xs truncate pl-5">
-              {monitor.url.replace(/^https?:\/\//, "")}
+              ---
             </p>
           )}
         </div>

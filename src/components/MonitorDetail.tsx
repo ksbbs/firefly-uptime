@@ -89,11 +89,6 @@ export default function MonitorDetail({
               <h2 className="text-lg font-semibold text-text-primary">
                 {monitor.name}
               </h2>
-              {monitor.url && (
-                <p className="text-text-muted text-xs truncate max-w-[300px]">
-                  {monitor.url}
-                </p>
-              )}
             </div>
           </div>
           <div className="flex items-center gap-3">
