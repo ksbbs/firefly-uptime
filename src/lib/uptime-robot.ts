@@ -48,6 +48,15 @@ export async function fetchMonitors(
   return (data.monitors || []).map(formatMonitor);
 }
 
+function toNum(val: unknown, fallback = 0): number {
+  if (typeof val === "number") return val;
+  if (typeof val === "string") {
+    const n = parseFloat(val);
+    return isNaN(n) ? fallback : n;
+  }
+  return fallback;
+}
+
 function formatMonitor(monitor: UptimeRobotMonitor): FormattedMonitor {
   const statusLabels: Record<number, string> = {
     0: "Paused",
@@ -67,12 +76,12 @@ function formatMonitor(monitor: UptimeRobotMonitor): FormattedMonitor {
     url: monitor.url,
     status: monitor.status,
     statusLabel: statusLabels[monitor.status] || "Unknown",
-    uptimeRatio: monitor.custom_uptime_ratio ?? 100,
-    averageResponseTime: monitor.average_response_time ?? 0,
+    uptimeRatio: toNum(monitor.custom_uptime_ratio, 100),
+    averageResponseTime: toNum(monitor.average_response_time),
     logs,
     responseTimes: (monitor.response_times || []).map((rt) => ({
       datetime: rt.datetime,
-      value: rt.value,
+      value: toNum(rt.value),
     })),
     incidents: logs.filter((log: MonitorLog) => log.type === 2),
   };
