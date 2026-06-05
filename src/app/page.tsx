@@ -6,6 +6,7 @@ import { MONITOR_STATUS } from "@/lib/types";
 import StatusHeader from "@/components/StatusHeader";
 import SearchFilter from "@/components/SearchFilter";
 import MonitorCard from "@/components/MonitorCard";
+import MonitorDetail from "@/components/MonitorDetail";
 import IncidentTimeline from "@/components/IncidentTimeline";
 
 interface StatusPageData {
@@ -98,6 +99,7 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState<"all" | "up" | "down" | "paused">("all");
+  const [selectedMonitor, setSelectedMonitor] = useState<FormattedMonitor | null>(null);
 
   const fetchData = useCallback(async () => {
     try {
@@ -211,7 +213,10 @@ export default function Home() {
                 key={monitor.id}
                 className={`animate-slide-up stagger-${Math.min(index + 1, 8)}`}
               >
-                <MonitorCard monitor={monitor} />
+                <MonitorCard
+                  monitor={monitor}
+                  onClick={() => setSelectedMonitor(monitor)}
+                />
               </div>
             ))}
           </div>
@@ -228,6 +233,14 @@ export default function Home() {
         {/* Incident Timeline */}
         <IncidentTimeline incidents={data.incidents} />
       </div>
+
+      {/* Monitor Detail Modal */}
+      {selectedMonitor && (
+        <MonitorDetail
+          monitor={selectedMonitor}
+          onClose={() => setSelectedMonitor(null)}
+        />
+      )}
     </div>
   );
 }

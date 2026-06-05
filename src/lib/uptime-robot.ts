@@ -1,14 +1,89 @@
 import type {
-  UptimeRobotResponse,
-  UptimeRobotMonitor,
   FormattedMonitor,
   Incident,
+  OverallStatus,
   MonitorLog,
+  MonitorStatus,
   UptimeRatios,
 } from "./types";
 import { LOG_TYPE } from "./types";
+import { fetchMonitorsV3 } from "./uptime-robot-v3";
 
-const API_BASE = "https://api.uptimerobot.com/v2";
+// v2 API raw response types (only used in v2 fallback)
+interface V2MonitorLog {
+  id: number;
+  type: number;
+  datetime: number;
+  duration: number;
+  reason?: { code: string; detail: string };
+}
+
+interface V2ResponseTime {
+  datetime: number;
+  value: number;
+}
+
+interface UptimeRobotMonitor {
+  id: number;
+  friendly_name: string;
+  url: string;
+  type: number;
+  sub_type?: string;
+  keyword_type?: string;
+  keyword_value?: string;
+  http_method?: number;
+  port?: string;
+  interval?: number;
+  status: MonitorStatus;
+  logs?: V2MonitorLog[];
+  custom_uptime_ratio?: number;
+  custom_uptime_ranges?: string;
+  average_response_time?: number;
+  response_times?: V2ResponseTime[];
+  create_datetime?: number;
+}
+
+interface V2Error {
+  type: string;
+  message: string;
+}
+
+interface UptimeRobotResponse {
+  stat: "ok" | "fail";
+  monitors?: UptimeRobotMonitor[];
+  total?: number;
+  offset?: number;
+  limit?: number;
+  error?: V2Error;
+}
+
+// ============================================================
+// v3 为主，v2 降级
+// ============================================================
+
+/**
+ * 尝试用 v3 API 获取，如果 UPTIME_ROBOT_JWT 未配置则用 v2 API Key
+ * 优先使用 v3 (JWT Bearer Token)
+ */
+export async function fetchMonitors(
+  jwtOrKey: string,
+  isV3 = false
+): Promise<FormattedMonitor[]> {
+  // v3: JWT Bearer Token
+  if (isV3) {
+    const result = await fetchMonitorsV3(jwtOrKey);
+    return result.monitors;
+  }
+
+  // v2: API Key fallback
+  return fetchMonitorsV2(jwtOrKey);
+}
+
+// ============================================================
+// v2 API 客户端（降级方案）
+// ============================================================
+
+const API_BASE_V2 = "https://api.uptimerobot.com/v2";
 
 function toNum(val: unknown, fallback = 0): number {
   if (typeof val === "number") return val;
@@ -19,7 +94,6 @@ function toNum(val: unknown, fallback = 0): number {
   return fallback;
 }
 
-/** Parse Uptime Robot custom_uptime_ranges like "99.98-97.50-95.00" into separate periods */
 function parseUptimeRanges(ranges?: string): UptimeRatios {
   const parts = (ranges || "")
     .split("-")
@@ -32,10 +106,8 @@ function parseUptimeRanges(ranges?: string): UptimeRatios {
   };
 }
 
-export async function fetchMonitors(
-  apiKey: string
-): Promise<FormattedMonitor[]> {
-  const response = await fetch(`${API_BASE}/getMonitors`, {
+async function fetchMonitorsV2(apiKey: string): Promise<FormattedMonitor[]> {
+  const response = await fetch(`${API_BASE_V2}/getMonitors`, {
     method: "POST",
     headers: {
       "content-type": "application/x-www-form-urlencoded",
@@ -58,21 +130,21 @@ export async function fetchMonitors(
   });
 
   if (!response.ok) {
-    throw new Error(`Uptime Robot API error: ${response.status}`);
+    throw new Error(`Uptime Robot v2 API error: ${response.status}`);
   }
 
   const data: UptimeRobotResponse = await response.json();
 
   if (data.stat === "fail") {
     throw new Error(
-      `Uptime Robot API error: ${data.error?.message || "Unknown"}`
+      `Uptime Robot v2 API error: ${data.error?.message || "Unknown"}`
     );
   }
 
-  return (data.monitors || []).map(formatMonitor);
+  return (data.monitors || []).map(formatV2Monitor);
 }
 
-function formatMonitor(monitor: UptimeRobotMonitor): FormattedMonitor {
+function formatV2Monitor(monitor: UptimeRobotMonitor): FormattedMonitor {
   const statusLabels: Record<number, string> = {
     0: "Paused",
     1: "Pending",
@@ -82,8 +154,14 @@ function formatMonitor(monitor: UptimeRobotMonitor): FormattedMonitor {
   };
 
   const allLogs = (monitor.logs || []).filter(
-    (log: MonitorLog) => log.type === LOG_TYPE.DOWN || log.type === LOG_TYPE.UP
-  );
+    (log: V2MonitorLog) => log.type === LOG_TYPE.DOWN || log.type === LOG_TYPE.UP
+  ).map((log) => ({
+    id: log.id,
+    type: log.type,
+    datetime: log.datetime,
+    duration: log.duration,
+    reason: log.reason,
+  }));
 
   return {
     id: monitor.id,
@@ -91,6 +169,8 @@ function formatMonitor(monitor: UptimeRobotMonitor): FormattedMonitor {
     url: monitor.url,
     status: monitor.status,
     statusLabel: statusLabels[monitor.status] || "Unknown",
+    monitorType: String(monitor.type),
+    interval: monitor.interval ?? 300,
     uptimeRatios: parseUptimeRanges(monitor.custom_uptime_ranges),
     averageResponseTime: toNum(monitor.average_response_time),
     logs: allLogs,
@@ -98,15 +178,15 @@ function formatMonitor(monitor: UptimeRobotMonitor): FormattedMonitor {
       datetime: rt.datetime,
       value: toNum(rt.value),
     })),
-    /** DOWN events = incidents */
-    downEvents: allLogs.filter((log: MonitorLog) => log.type === LOG_TYPE.DOWN),
+    downEvents: allLogs.filter((log) => log.type === LOG_TYPE.DOWN),
   };
 }
 
-export function getOverallStatus(monitors: FormattedMonitor[]): {
-  status: "operational" | "degraded" | "down";
-  label: string;
-} {
+// ============================================================
+// 通用工具函数
+// ============================================================
+
+export function getOverallStatus(monitors: FormattedMonitor[]): OverallStatus {
   const down = monitors.filter((m) => m.status === 8 || m.status === 9);
   const paused = monitors.filter((m) => m.status === 0);
 
@@ -139,6 +219,7 @@ export function getIncidents(monitors: FormattedMonitor[]): Incident[] {
         datetime: log.datetime,
         duration: log.duration,
         isOngoing: log.duration === 0 && now - log.datetime < 86400,
+        reason: log.reason?.detail,
       });
     }
   }

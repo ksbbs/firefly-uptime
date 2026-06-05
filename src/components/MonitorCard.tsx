@@ -5,6 +5,7 @@ import MiniHistoryBar from "./MiniHistoryBar";
 
 interface MonitorCardProps {
   monitor: FormattedMonitor;
+  onClick?: () => void;
 }
 
 function getStatusConfig(status: number) {
@@ -66,7 +67,7 @@ function UptimeBadge({ value, label }: { value: number; label: string }) {
   );
 }
 
-export default function MonitorCard({ monitor }: MonitorCardProps) {
+export default function MonitorCard({ monitor, onClick }: MonitorCardProps) {
   const config = getStatusConfig(monitor.status);
   const isDown =
     monitor.status === MONITOR_STATUS.DOWN ||
@@ -74,8 +75,9 @@ export default function MonitorCard({ monitor }: MonitorCardProps) {
   const downCount = monitor.downEvents.length;
 
   return (
-    <div
-      className={`rounded-2xl bg-bg-card border border-border hover:border-accent/20 p-5 transition-all duration-300 hover:shadow-lg hover:shadow-accent-glow hover:-translate-y-0.5 animate-fade-in`}
+    <button
+      onClick={onClick}
+      className="w-full text-left rounded-2xl bg-bg-card border border-border hover:border-accent/20 p-5 transition-all duration-300 hover:shadow-lg hover:shadow-accent-glow hover:-translate-y-0.5 animate-fade-in cursor-pointer group"
     >
       {/* Header: Name + Status */}
       <div className="flex items-start justify-between mb-4">
@@ -168,6 +170,15 @@ export default function MonitorCard({ monitor }: MonitorCardProps) {
         </div>
         <MiniHistoryBar logs={monitor.logs} days={7} />
       </div>
-    </div>
+
+      {/* Click hint */}
+      <div className="mt-3 pt-2 border-t border-border/50 flex items-center justify-center gap-1 text-text-muted/40 group-hover:text-text-muted/60 text-[10px] transition-colors">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+          <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
+          <circle cx="12" cy="12" r="3" />
+        </svg>
+        点击查看详情
+      </div>
+    </button>
   );
 }
