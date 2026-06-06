@@ -16,8 +16,11 @@ import { v3StatusToInternal, v3StatusToLabel, LOG_TYPE } from "./types";
 
 const API_BASE = "https://api.uptimerobot.com/v3";
 
-/** 并行请求的最大并发数，避免触发 UptimeRobot rate limit (10 req/s) */
-const MAX_CONCURRENCY = 8;
+/**
+ * 为遵守 UptimeRobot v3 API rate limit（免费版 10 req/min），
+ * 请求间最少间隔 1 秒。并发数设 1 → 完全串行。
+ */
+const INTER_REQUEST_DELAY_MS = 1000;
 
 // ============================================================
 // 工具函数
@@ -42,70 +45,87 @@ function daysAgoISO(days: number): string {
   return new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
 }
 
-// ============================================================
-// 并发控制
-// ============================================================
-
-/**
- * 带并发上限的并行执行。
- * 单个 task 失败时对应位置填 null，不阻塞其他 task。
- */
-async function parallelWithLimit<T>(
-  tasks: (() => Promise<T>)[],
-  limit: number,
-): Promise<(T | null)[]> {
-  const results: (T | null)[] = new Array(tasks.length).fill(null);
-  let cursor = 0;
-
-  async function worker() {
-    while (cursor < tasks.length) {
-      const i = cursor++;
-      try {
-        results[i] = await tasks[i]();
-      } catch {
-        // 单个失败 → null，不中断整体
-      }
-    }
-  }
-
-  const workers = Math.min(limit, tasks.length);
-  await Promise.all(Array.from({ length: workers }, () => worker()));
-  return results;
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 // ============================================================
-// v3 API 调用
+// 服务端内存缓存（存活在 warm function instance 中）
 // ============================================================
+
+interface CacheEntry<T> {
+  data: T;
+  timestamp: number;
+}
+
+const g = globalThis as Record<string, unknown>;
+
+function cacheGet<T>(key: string): T | null {
+  const store = (g.__uptimeCache as Record<string, CacheEntry<T>>) || {};
+  g.__uptimeCache = store;
+  const entry = store[key];
+  if (entry && Date.now() - entry.timestamp < 5 * 60 * 1000) {
+    return entry.data;
+  }
+  return null;
+}
+
+function cacheSet<T>(key: string, data: T): void {
+  const store = (g.__uptimeCache as Record<string, CacheEntry<T>>) || {};
+  store[key] = { data, timestamp: Date.now() };
+  g.__uptimeCache = store;
+}
+
+// ============================================================
+// v3 API 调用（每个函数都自带 fetch 缓存 + 429 重试）
+// ============================================================
+
+async function v3Fetch<T>(
+  url: string,
+  jwt: string,
+  revalidateSeconds: number,
+  retries = 2,
+): Promise<T> {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const res = await fetch(url, {
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        "Content-Type": "application/json",
+      },
+      next: { revalidate: revalidateSeconds },
+    });
+
+    if (res.ok) return res.json() as Promise<T>;
+
+    if (res.status === 429 && attempt < retries) {
+      // Rate limited → 指数退避重试
+      const backoff = Math.pow(2, attempt + 2) * 1000; // 4s, 8s, ...
+      console.warn(`[uptime-robot] 429 rate limited, retrying in ${backoff / 1000}s (attempt ${attempt + 1}/${retries})`);
+      await delay(backoff);
+      continue;
+    }
+
+    const body = await res.text().catch(() => "");
+    throw new Error(
+      `${res.status}${body ? ` - ${body.slice(0, 200)}` : ""}`,
+    );
+  }
+  throw new Error("Max retries exceeded");
+}
 
 /** Step 1: 获取全量 monitor 列表 */
 async function fetchMonitorList(jwt: string): Promise<V3MonitorListItem[]> {
-  const res = await fetch(`${API_BASE}/monitors?limit=200`, {
-    headers: {
-      Authorization: `Bearer ${jwt}`,
-      "Content-Type": "application/json",
-    },
-    next: { revalidate: 30 },
-  });
-
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new Error(
-      `Uptime Robot v3 API error (monitors): ${res.status}${body ? ` - ${body.slice(0, 200)}` : ""}`,
-    );
-  }
-
-  const json = await res.json();
-  const monitors: V3MonitorListItem[] = json.data ?? [];
-
-  // 如果超过 200 个 monitor，记录警告（当前 limit=200 是最大值）
+  const json = await v3Fetch<{ nextLink: string | null; data: V3MonitorListItem[] }>(
+    `${API_BASE}/monitors?limit=200`,
+    jwt,
+    30,
+  );
   if (json.nextLink) {
     console.warn(
-      `[uptime-robot] Monitor count exceeds 200 (pagination detected). ` +
-        `Only the first 200 monitors are loaded. Consider filtering by groupId.`,
+      "[uptime-robot] Monitor count exceeds 200 (pagination detected).",
     );
   }
-
-  return monitors;
+  return json.data ?? [];
 }
 
 /** Step 2a: 获取单个 monitor 的 uptime 统计 */
@@ -118,14 +138,11 @@ async function fetchUptimeStats(
     from: daysAgoISO(days),
     to: new Date().toISOString(),
   });
-  const res = await fetch(
+  return v3Fetch<V3UptimeStats>(
     `${API_BASE}/monitors/${monitorId}/stats/uptime?${params}`,
-    { headers: { Authorization: `Bearer ${jwt}` } },
+    jwt,
+    300, // 5 分钟缓存
   );
-  if (!res.ok) {
-    throw new Error(`Uptime stats failed for monitor ${monitorId}: ${res.status}`);
-  }
-  return res.json();
 }
 
 /** Step 2b: 获取单个 monitor 的响应时间统计（含时间序列） */
@@ -138,16 +155,11 @@ async function fetchResponseTimeStats(
     to: new Date().toISOString(),
     includeTimeSeries: "true",
   });
-  const res = await fetch(
+  return v3Fetch<V3ResponseTimeStats>(
     `${API_BASE}/monitors/${monitorId}/stats/response-time?${params}`,
-    { headers: { Authorization: `Bearer ${jwt}` } },
+    jwt,
+    300,
   );
-  if (!res.ok) {
-    throw new Error(
-      `Response time stats failed for monitor ${monitorId}: ${res.status}`,
-    );
-  }
-  return res.json();
 }
 
 /** Step 3: 获取过去 90 天的宕机事件 */
@@ -156,13 +168,11 @@ async function fetchIncidents(jwt: string): Promise<V3IncidentItem[]> {
     started_after: daysAgoISO(90),
     limit: "50",
   });
-  const res = await fetch(`${API_BASE}/incidents?${params}`, {
-    headers: { Authorization: `Bearer ${jwt}` },
-  });
-  if (!res.ok) {
-    throw new Error(`Incidents fetch failed: ${res.status}`);
-  }
-  const json = await res.json();
+  const json = await v3Fetch<{ nextLink: string | null; data: V3IncidentItem[] }>(
+    `${API_BASE}/incidents?${params}`,
+    jwt,
+    300,
+  );
   return json.data ?? [];
 }
 
@@ -171,24 +181,31 @@ async function fetchIncidents(jwt: string): Promise<V3IncidentItem[]> {
 // ============================================================
 
 /**
- * 使用 v3 REST API 获取全部 monitor 及其详细 stats。
+ * 使用 v3 REST API 获取全部 monitor 及详细 stats。
  *
- * 数据流：
- *   1. GET /monitors?limit=200      → 基本列表
- *   2. 并行 GET /monitors/{id}/stats/uptime     (7d/30d/90d × N)
- *            GET /monitors/{id}/stats/response-time  (1d × N)
- *   3. GET /incidents?started_after=90d → 宕机事件
+ * 调用策略（遵守 10 req/min rate limit）：
+ *   1. GET /monitors?limit=200                             → 1 次
+ *   2. 串行调用（间隔 1s）每个 monitor 的 uptime (×3) + response-time (×1)
+ *   3. GET /incidents?started_after=90d&limit=50          → 1 次
  *
- * 所有 stats 调用在服务端并行执行，通过 ISR 30s 缓存降低 API 压力。
- * 单个 monitor 的 stats 失败不影响其他 monitor（对应字段填默认值）。
+ * 结果缓存在服务端内存（globalThis）5 分钟，
+ * 每个 fetch 额外有 Next.js Data Cache 兜底。
  */
 export async function fetchMonitors(
   jwt: string,
 ): Promise<FormattedMonitor[]> {
+  // ── 检查内存缓存 ──────────────────────────────────────────
+  const cached = cacheGet<FormattedMonitor[]>("monitors");
+  if (cached) return cached;
+
   // ── Step 1: 获取 monitor 列表 ──────────────────────────────
   const monitorItems = await fetchMonitorList(jwt);
 
-  if (monitorItems.length === 0) return [];
+  if (monitorItems.length === 0) {
+    const empty: FormattedMonitor[] = [];
+    cacheSet("monitors", empty);
+    return empty;
+  }
 
   // 构建 FormattedMonitor 骨架（stats 待填充）
   const monitors: FormattedMonitor[] = monitorItems.map((item) => ({
@@ -206,36 +223,45 @@ export async function fetchMonitors(
     downEvents: [],
   }));
 
-  // ── Step 2: 并行获取每个 monitor 的 stats ──────────────────
-  const statsTasks: (() => Promise<void>)[] = [];
-
+  // ── Step 2: 串行获取每个 monitor 的 stats ──────────────────
+  // 每个 monitor：3 次 uptime + 1 次 response-time = 4 次串行调用
+  // monitor 之间也串行，每次调用间隔 >=1s，确保不超 10 req/min
   for (const mon of monitors) {
-    statsTasks.push(async () => {
-      // 4 个独立 API 调用：3 个时间范围 uptime + 1 个响应时间
-      const [r7, r30, r90, rt] = await Promise.all([
-        fetchUptimeStats(jwt, mon.id, 7).catch(() => null),
-        fetchUptimeStats(jwt, mon.id, 30).catch(() => null),
-        fetchUptimeStats(jwt, mon.id, 90).catch(() => null),
-        fetchResponseTimeStats(jwt, mon.id).catch(() => null),
-      ]);
+    // uptime stats (7d / 30d / 90d) — 串行，间隔 1s
+    try {
+      mon.uptimeRatios.ratio7d = (await fetchUptimeStats(jwt, mon.id, 7)).uptime;
+    } catch (e) {
+      console.warn(`[uptime-robot] uptime 7d failed for ${mon.name}:`, e);
+    }
+    await delay(INTER_REQUEST_DELAY_MS);
 
-      mon.uptimeRatios = {
-        ratio7d: r7?.uptime ?? 100,
-        ratio30d: r30?.uptime ?? 100,
-        ratio90d: r90?.uptime ?? 100,
-      };
+    try {
+      mon.uptimeRatios.ratio30d = (await fetchUptimeStats(jwt, mon.id, 30)).uptime;
+    } catch (e) {
+      console.warn(`[uptime-robot] uptime 30d failed for ${mon.name}:`, e);
+    }
+    await delay(INTER_REQUEST_DELAY_MS);
 
-      if (rt) {
-        mon.averageResponseTime = Math.round(rt.summary.avg);
-        mon.responseTimes = (rt.time_series || []).map((ts) => ({
-          datetime: isoToUnix(ts.datetime),
-          value: toNum(ts.value),
-        }));
-      }
-    });
+    try {
+      mon.uptimeRatios.ratio90d = (await fetchUptimeStats(jwt, mon.id, 90)).uptime;
+    } catch (e) {
+      console.warn(`[uptime-robot] uptime 90d failed for ${mon.name}:`, e);
+    }
+    await delay(INTER_REQUEST_DELAY_MS);
+
+    // response time
+    try {
+      const rt = await fetchResponseTimeStats(jwt, mon.id);
+      mon.averageResponseTime = Math.round(rt.summary.avg);
+      mon.responseTimes = (rt.time_series || []).map((ts) => ({
+        datetime: isoToUnix(ts.datetime),
+        value: toNum(ts.value),
+      }));
+    } catch (e) {
+      console.warn(`[uptime-robot] response-time failed for ${mon.name}:`, e);
+    }
+    await delay(INTER_REQUEST_DELAY_MS);
   }
-
-  await parallelWithLimit(statsTasks, MAX_CONCURRENCY);
 
   // ── Step 3: 获取 incidents（宕机事件） ─────────────────────
   try {
@@ -244,15 +270,13 @@ export async function fetchMonitors(
     for (const inc of incidents) {
       const mon = monitors.find((m) => m.id === inc.monitor.id);
       if (!mon) continue;
-
-      // 仅纳入 DOWNTIME 类型的事件
       if (inc.type !== "DOWNTIME") continue;
 
       const log: MonitorLog = {
         id: parseInt(inc.id, 10) || 0,
         type: LOG_TYPE.DOWN,
         datetime: isoToUnix(inc.startedAt),
-        duration: inc.duration ?? 0, // null → 0 表示进行中
+        duration: inc.duration ?? 0,
         reason: inc.reason
           ? { code: "DOWNTIME", detail: inc.reason }
           : undefined,
@@ -261,9 +285,12 @@ export async function fetchMonitors(
       mon.logs.push(log);
       mon.downEvents.push(log);
     }
-  } catch (err) {
-    console.warn("[uptime-robot] Failed to fetch incidents, continuing without:", err);
+  } catch (e) {
+    console.warn("[uptime-robot] Failed to fetch incidents:", e);
   }
+
+  // ── 写入内存缓存 ──────────────────────────────────────────
+  cacheSet("monitors", monitors);
 
   return monitors;
 }
@@ -304,7 +331,6 @@ export function getIncidents(monitors: FormattedMonitor[]): Incident[] {
         monitorUrl: monitor.url,
         datetime: log.datetime,
         duration: log.duration,
-        // 持续时间为 0 且在 24 小时内视为进行中
         isOngoing: log.duration === 0 && now - log.datetime < 86400,
         reason: log.reason?.detail,
       });
