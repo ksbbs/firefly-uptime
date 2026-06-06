@@ -332,9 +332,13 @@ async function fillResponseTimes(
 
     try {
       const rt = await fetchOneResponseTime(jwt, mon.id);
+      const tsData = rt.time_series || [];
       const data: CachedRT = {
-        responseTimes: (rt.time_series || []).map((ts) => ({
-          datetime: isoToUnix(ts.datetime),
+        responseTimes: tsData.map((ts, idx) => ({
+          // v3 可能返回 null datetime，用合成时间戳兜底
+          datetime: ts.datetime
+            ? isoToUnix(ts.datetime)
+            : Math.floor(Date.now() / 1000) - (tsData.length - 1 - idx) * 300,
           value: toNum(ts.value),
         })),
         averageResponseTime: Math.round(rt.summary.avg),
