@@ -406,8 +406,8 @@ async function fillResponseTimes(
       mon.averageResponseTime = data.averageResponseTime;
       fresh[mon.id] = data;
 
-      // 请求间间隔：遵守 rate limit
-      await delay(1000);
+      // 请求间间隔：遵守 rate limit（每 3 秒一次，确保不超 10/min）
+      await delay(3000);
     } catch (e) {
       console.warn(
         `[uptime-robot] Response time fetch failed for ${mon.name}:`,

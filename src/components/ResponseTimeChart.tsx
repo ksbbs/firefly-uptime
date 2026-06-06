@@ -19,10 +19,19 @@ export default function ResponseTimeChart({ data }: ResponseTimeChartProps) {
   const avg = Math.round(values.reduce((a, b) => a + b, 0) / values.length);
   const latest = values[values.length - 1];
 
-  // Y 轴裁剪：用 P95 避免单个超时极值拉平整个图表
+  // Y 轴裁剪：用 IQR 盒须图法隔离异常值
+  // Q3 + 1.5×IQR 是标准箱线图上须，精准剔除 timeout 极值
   const sorted = [...values].sort((a, b) => a - b);
-  const p95 = sorted[Math.floor(sorted.length * 0.95)];
-  const chartMax = Math.max(p95, avg * 1.5, 1);
+  const q1 = sorted[Math.floor(sorted.length * 0.25)];
+  const q3 = sorted[Math.floor(sorted.length * 0.75)];
+  const iqr = q3 - q1 || 1;
+  const upperFence = q3 + 1.5 * iqr;
+  // 图表上限：IQR 上须、或 avg×2、或最大值的 90%（取较小者来裁剪）
+  const chartMax = Math.max(
+    Math.min(upperFence, sorted[Math.floor(sorted.length * 0.9)], max),
+    avg * 2,
+    10,
+  );
   const isTruncated = max > chartMax;
 
   const barCount = data.length;
