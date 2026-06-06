@@ -3,8 +3,8 @@ import type {
   Incident,
   MonitorLog,
   OverallStatus,
+  UptimeRatios,
   V3MonitorListItem,
-  V3UptimeStats,
   V3ResponseTimeStats,
   V3IncidentItem,
 } from "./types";
@@ -15,12 +15,6 @@ import { v3StatusToInternal, v3StatusToLabel, LOG_TYPE } from "./types";
 // ============================================================
 
 const API_BASE = "https://api.uptimerobot.com/v3";
-
-/**
- * 为遵守 UptimeRobot v3 API rate limit（免费版 10 req/min），
- * 请求间最少间隔 1 秒。并发数设 1 → 完全串行。
- */
-const INTER_REQUEST_DELAY_MS = 1000;
 
 // ============================================================
 // 工具函数
@@ -35,12 +29,10 @@ function toNum(val: unknown, fallback = 0): number {
   return fallback;
 }
 
-/** ISO 8601 字符串 → Unix 时间戳（秒） */
 function isoToUnix(iso: string): number {
   return Math.floor(new Date(iso).getTime() / 1000);
 }
 
-/** 返回 N 天前的 ISO 8601 字符串 */
 function daysAgoISO(days: number): string {
   return new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
 }
@@ -50,7 +42,42 @@ function delay(ms: number): Promise<void> {
 }
 
 // ============================================================
-// 服务端内存缓存（存活在 warm function instance 中）
+// Uptime 比率计算（基于 incidents 的 downtime 时长）
+// ============================================================
+
+/**
+ * 从 incidents 列表计算指定时间窗口的 uptime 比率。
+ * 正确处置跨窗口边界的事件（只统计落在窗口内的时长）。
+ */
+function calcUptimeFromIncidents(
+  incidents: V3IncidentItem[],
+  days: number,
+  now: number,
+): number {
+  const periodStart = now - days * 24 * 3600;
+  const periodSeconds = days * 24 * 3600;
+
+  let totalDowntime = 0;
+
+  for (const inc of incidents) {
+    if (inc.type !== "DOWNTIME") continue;
+
+    const start = isoToUnix(inc.startedAt);
+    const end = inc.resolvedAt ? isoToUnix(inc.resolvedAt) : now;
+
+    // 统计与当前窗口的重叠时长
+    const overlapStart = Math.max(start, periodStart);
+    const overlapEnd = Math.min(end, now);
+    if (overlapStart < overlapEnd) {
+      totalDowntime += overlapEnd - overlapStart;
+    }
+  }
+
+  return Math.max(0, ((periodSeconds - totalDowntime) / periodSeconds) * 100);
+}
+
+// ============================================================
+// 服务端内存缓存（globalThis，存活在 warm instance 中）
 // ============================================================
 
 interface CacheEntry<T> {
@@ -58,95 +85,78 @@ interface CacheEntry<T> {
   timestamp: number;
 }
 
-const g = globalThis as Record<string, unknown>;
-
-function cacheGet<T>(key: string): T | null {
-  const store = (g.__uptimeCache as Record<string, CacheEntry<T>>) || {};
-  g.__uptimeCache = store;
+function cacheGet<T>(key: string, ttlMs: number): T | null {
+  const store = (globalThis as Record<string, unknown>).__uptimeCache as
+    | Record<string, CacheEntry<T>>
+    | undefined;
+  if (!store) return null;
   const entry = store[key];
-  if (entry && Date.now() - entry.timestamp < 5 * 60 * 1000) {
-    return entry.data;
-  }
+  if (entry && Date.now() - entry.timestamp < ttlMs) return entry.data;
   return null;
 }
 
 function cacheSet<T>(key: string, data: T): void {
-  const store = (g.__uptimeCache as Record<string, CacheEntry<T>>) || {};
-  store[key] = { data, timestamp: Date.now() };
-  g.__uptimeCache = store;
+  const g = globalThis as Record<string, unknown>;
+  if (!g.__uptimeCache) g.__uptimeCache = {};
+  (g.__uptimeCache as Record<string, CacheEntry<T>>)[key] = {
+    data,
+    timestamp: Date.now(),
+  };
 }
 
 // ============================================================
-// v3 API 调用（每个函数都自带 fetch 缓存 + 429 重试）
+// v3 API 调用
 // ============================================================
 
-async function v3Fetch<T>(
-  url: string,
-  jwt: string,
-  revalidateSeconds: number,
-  retries = 2,
-): Promise<T> {
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    const res = await fetch(url, {
-      headers: {
-        Authorization: `Bearer ${jwt}`,
-        "Content-Type": "application/json",
-      },
-      next: { revalidate: revalidateSeconds },
-    });
+/** 获取全量 monitor 列表 */
+async function fetchMonitorList(jwt: string): Promise<V3MonitorListItem[]> {
+  const res = await fetch(`${API_BASE}/monitors?limit=200`, {
+    headers: {
+      Authorization: `Bearer ${jwt}`,
+      "Content-Type": "application/json",
+    },
+    next: { revalidate: 30 },
+  });
 
-    if (res.ok) return res.json() as Promise<T>;
-
-    if (res.status === 429 && attempt < retries) {
-      // Rate limited → 指数退避重试
-      const backoff = Math.pow(2, attempt + 2) * 1000; // 4s, 8s, ...
-      console.warn(`[uptime-robot] 429 rate limited, retrying in ${backoff / 1000}s (attempt ${attempt + 1}/${retries})`);
-      await delay(backoff);
-      continue;
-    }
-
+  if (!res.ok) {
     const body = await res.text().catch(() => "");
     throw new Error(
-      `${res.status}${body ? ` - ${body.slice(0, 200)}` : ""}`,
+      `Monitor list error ${res.status}${body ? ` - ${body.slice(0, 200)}` : ""}`,
     );
   }
-  throw new Error("Max retries exceeded");
-}
 
-/** Step 1: 获取全量 monitor 列表 */
-async function fetchMonitorList(jwt: string): Promise<V3MonitorListItem[]> {
-  const json = await v3Fetch<{ nextLink: string | null; data: V3MonitorListItem[] }>(
-    `${API_BASE}/monitors?limit=200`,
-    jwt,
-    30,
-  );
-  if (json.nextLink) {
-    console.warn(
-      "[uptime-robot] Monitor count exceeds 200 (pagination detected).",
-    );
-  }
+  const json = await res.json();
   return json.data ?? [];
 }
 
-/** Step 2a: 获取单个 monitor 的 uptime 统计 */
-async function fetchUptimeStats(
-  jwt: string,
-  monitorId: number,
-  days: number,
-): Promise<V3UptimeStats> {
+/** 获取过去 90 天的全部 incidents */
+async function fetchAllIncidents(jwt: string): Promise<V3IncidentItem[]> {
   const params = new URLSearchParams({
-    from: daysAgoISO(days),
-    to: new Date().toISOString(),
+    started_after: daysAgoISO(90),
+    limit: "500",
   });
-  return v3Fetch<V3UptimeStats>(
-    `${API_BASE}/monitors/${monitorId}/stats/uptime?${params}`,
-    jwt,
-    300, // 5 分钟缓存
-  );
+
+  const res = await fetch(`${API_BASE}/incidents?${params}`, {
+    headers: {
+      Authorization: `Bearer ${jwt}`,
+      "Content-Type": "application/json",
+    },
+    next: { revalidate: 60 },
+  });
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(
+      `Incidents error ${res.status}${body ? ` - ${body.slice(0, 200)}` : ""}`,
+    );
+  }
+
+  const json = await res.json();
+  return json.data ?? [];
 }
 
-/** Step 2b: 获取单个 monitor 的响应时间统计（含时间序列） */
-async function fetchResponseTimeStats(
+/** 获取单个 monitor 的响应时间（仅响应时间缓存过期时调用） */
+async function fetchOneResponseTime(
   jwt: string,
   monitorId: number,
 ): Promise<V3ResponseTimeStats> {
@@ -155,144 +165,212 @@ async function fetchResponseTimeStats(
     to: new Date().toISOString(),
     includeTimeSeries: "true",
   });
-  return v3Fetch<V3ResponseTimeStats>(
-    `${API_BASE}/monitors/${monitorId}/stats/response-time?${params}`,
-    jwt,
-    300,
-  );
-}
 
-/** Step 3: 获取过去 90 天的宕机事件 */
-async function fetchIncidents(jwt: string): Promise<V3IncidentItem[]> {
-  const params = new URLSearchParams({
-    started_after: daysAgoISO(90),
-    limit: "50",
-  });
-  const json = await v3Fetch<{ nextLink: string | null; data: V3IncidentItem[] }>(
-    `${API_BASE}/incidents?${params}`,
-    jwt,
-    300,
+  const res = await fetch(
+    `${API_BASE}/monitors/${monitorId}/stats/response-time?${params}`,
+    { headers: { Authorization: `Bearer ${jwt}` } },
   );
-  return json.data ?? [];
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(
+      `Response time error ${res.status}${body ? ` - ${body.slice(0, 200)}` : ""}`,
+    );
+  }
+
+  return res.json();
 }
 
 // ============================================================
-// 主入口
+// 主入口：2 次 API 调用 + 本地计算 uptime
 // ============================================================
 
 /**
- * 使用 v3 REST API 获取全部 monitor 及详细 stats。
+ * 使用 v3 API 获取全部数据。
  *
- * 调用策略（遵守 10 req/min rate limit）：
- *   1. GET /monitors?limit=200                             → 1 次
- *   2. 串行调用（间隔 1s）每个 monitor 的 uptime (×3) + response-time (×1)
- *   3. GET /incidents?started_after=90d&limit=50          → 1 次
+ * API 调用数（最小化以遵守 10 req/min 限制）：
+ *   1. GET /monitors?limit=200         → 基本列表
+ *   2. GET /incidents?limit=500        → 全部宕机事件（从中计算 uptime 比率）
+ *   3. GET /monitors/{id}/stats/response-time  → 仅响应时间缓存过期时逐 monitor 串行
  *
- * 结果缓存在服务端内存（globalThis）5 分钟，
- * 每个 fetch 额外有 Next.js Data Cache 兜底。
+ * 结果缓存在 globalThis 内存中，warm instance 期间秒返。
  */
 export async function fetchMonitors(
   jwt: string,
 ): Promise<FormattedMonitor[]> {
-  // ── 检查内存缓存 ──────────────────────────────────────────
-  const cached = cacheGet<FormattedMonitor[]>("monitors");
-  if (cached) return cached;
-
-  // ── Step 1: 获取 monitor 列表 ──────────────────────────────
-  const monitorItems = await fetchMonitorList(jwt);
-
-  if (monitorItems.length === 0) {
-    const empty: FormattedMonitor[] = [];
-    cacheSet("monitors", empty);
-    return empty;
+  // ── 检查缓存 ──────────────────────────────────────────────
+  const cached = cacheGet<FormattedMonitor[]>("monitors", 5 * 60 * 1000);
+  if (cached) {
+    // 后台补拉响应时间（如果过期）
+    fillResponseTimesAsync(jwt, cached);
+    return cached;
   }
 
-  // 构建 FormattedMonitor 骨架（stats 待填充）
-  const monitors: FormattedMonitor[] = monitorItems.map((item) => ({
-    id: item.id,
-    name: item.friendlyName,
-    url: item.url,
-    status: v3StatusToInternal(item.status),
-    statusLabel: v3StatusToLabel(item.status),
-    monitorType: String(item.type),
-    interval: item.interval,
-    uptimeRatios: { ratio7d: 100, ratio30d: 100, ratio90d: 100 },
-    averageResponseTime: 0,
-    logs: [],
-    responseTimes: [],
-    downEvents: [],
-  }));
+  // ── Step 1 + 2：并行获取 monitor 列表 & incidents ──────────
+  const [monitorItems, allIncidents] = await Promise.all([
+    fetchMonitorList(jwt),
+    fetchAllIncidents(jwt),
+  ]);
 
-  // ── Step 2: 串行获取每个 monitor 的 stats ──────────────────
-  // 每个 monitor：3 次 uptime + 1 次 response-time = 4 次串行调用
-  // monitor 之间也串行，每次调用间隔 >=1s，确保不超 10 req/min
-  for (const mon of monitors) {
-    // uptime stats (7d / 30d / 90d) — 串行，间隔 1s
-    try {
-      mon.uptimeRatios.ratio7d = (await fetchUptimeStats(jwt, mon.id, 7)).uptime;
-    } catch (e) {
-      console.warn(`[uptime-robot] uptime 7d failed for ${mon.name}:`, e);
-    }
-    await delay(INTER_REQUEST_DELAY_MS);
+  const now = Math.floor(Date.now() / 1000);
 
-    try {
-      mon.uptimeRatios.ratio30d = (await fetchUptimeStats(jwt, mon.id, 30)).uptime;
-    } catch (e) {
-      console.warn(`[uptime-robot] uptime 30d failed for ${mon.name}:`, e);
-    }
-    await delay(INTER_REQUEST_DELAY_MS);
+  // ── 构建 FormattedMonitor（uptime 从 incidents 本地计算）───
+  const monitors: FormattedMonitor[] = monitorItems.map((item) => {
+    // 该 monitor 的 DOWNTIME 事件
+    const monIncidents = allIncidents.filter(
+      (inc) => inc.monitor.id === item.id && inc.type === "DOWNTIME",
+    );
 
-    try {
-      mon.uptimeRatios.ratio90d = (await fetchUptimeStats(jwt, mon.id, 90)).uptime;
-    } catch (e) {
-      console.warn(`[uptime-robot] uptime 90d failed for ${mon.name}:`, e);
-    }
-    await delay(INTER_REQUEST_DELAY_MS);
+    // 本地计算 7d / 30d / 90d uptime
+    const uptimeRatios: UptimeRatios = {
+      ratio7d: calcUptimeFromIncidents(monIncidents, 7, now),
+      ratio30d: calcUptimeFromIncidents(monIncidents, 30, now),
+      ratio90d: calcUptimeFromIncidents(monIncidents, 90, now),
+    };
 
-    // response time
-    try {
-      const rt = await fetchResponseTimeStats(jwt, mon.id);
-      mon.averageResponseTime = Math.round(rt.summary.avg);
-      mon.responseTimes = (rt.time_series || []).map((ts) => ({
-        datetime: isoToUnix(ts.datetime),
-        value: toNum(ts.value),
-      }));
-    } catch (e) {
-      console.warn(`[uptime-robot] response-time failed for ${mon.name}:`, e);
-    }
-    await delay(INTER_REQUEST_DELAY_MS);
-  }
+    // 构建 downEvents / logs
+    const downEvents: MonitorLog[] = monIncidents.map((inc) => ({
+      id: parseInt(inc.id, 10) || 0,
+      type: LOG_TYPE.DOWN,
+      datetime: isoToUnix(inc.startedAt),
+      duration: inc.duration ?? 0,
+      reason: inc.reason
+        ? { code: "DOWNTIME", detail: inc.reason }
+        : undefined,
+    }));
 
-  // ── Step 3: 获取 incidents（宕机事件） ─────────────────────
-  try {
-    const incidents = await fetchIncidents(jwt);
+    return {
+      id: item.id,
+      name: item.friendlyName,
+      url: item.url,
+      status: v3StatusToInternal(item.status),
+      statusLabel: v3StatusToLabel(item.status),
+      monitorType: String(item.type),
+      interval: item.interval,
+      uptimeRatios,
+      averageResponseTime: 0,
+      logs: downEvents,
+      responseTimes: [],
+      downEvents,
+    };
+  });
 
-    for (const inc of incidents) {
-      const mon = monitors.find((m) => m.id === inc.monitor.id);
-      if (!mon) continue;
-      if (inc.type !== "DOWNTIME") continue;
-
-      const log: MonitorLog = {
-        id: parseInt(inc.id, 10) || 0,
-        type: LOG_TYPE.DOWN,
-        datetime: isoToUnix(inc.startedAt),
-        duration: inc.duration ?? 0,
-        reason: inc.reason
-          ? { code: "DOWNTIME", detail: inc.reason }
-          : undefined,
-      };
-
-      mon.logs.push(log);
-      mon.downEvents.push(log);
-    }
-  } catch (e) {
-    console.warn("[uptime-robot] Failed to fetch incidents:", e);
-  }
-
-  // ── 写入内存缓存 ──────────────────────────────────────────
   cacheSet("monitors", monitors);
 
+  // ── 响应时间：从缓存恢复或首次拉取 ─────────────────────────
+  await fillResponseTimes(jwt, monitors);
+
   return monitors;
+}
+
+// ============================================================
+// 响应时间（独立缓存，30 分钟 TTL）
+// ============================================================
+
+interface CachedRT {
+  responseTimes: { datetime: number; value: number }[];
+  averageResponseTime: number;
+}
+
+async function fillResponseTimes(
+  jwt: string,
+  monitors: FormattedMonitor[],
+): Promise<void> {
+  // 尝试从独立缓存恢复
+  const rtCache =
+    cacheGet<Record<number, CachedRT>>("responseTimes", 30 * 60 * 1000) || {};
+
+  let restored = 0;
+  for (const mon of monitors) {
+    const cached = rtCache[mon.id];
+    if (cached) {
+      mon.responseTimes = cached.responseTimes;
+      mon.averageResponseTime = cached.averageResponseTime;
+      restored++;
+    }
+  }
+
+  // 缓存完整命中 → 不需要 API 调用
+  if (restored === monitors.length) return;
+
+  // 缓存缺失 → 串行拉取（每秒 1 次，遵守 rate limit）
+  const fresh: Record<number, CachedRT> = { ...rtCache };
+
+  for (const mon of monitors) {
+    if (rtCache[mon.id]) continue; // 已从缓存恢复
+
+    try {
+      const rt = await fetchOneResponseTime(jwt, mon.id);
+      const data: CachedRT = {
+        responseTimes: (rt.time_series || []).map((ts) => ({
+          datetime: isoToUnix(ts.datetime),
+          value: toNum(ts.value),
+        })),
+        averageResponseTime: Math.round(rt.summary.avg),
+      };
+
+      mon.responseTimes = data.responseTimes;
+      mon.averageResponseTime = data.averageResponseTime;
+      fresh[mon.id] = data;
+
+      // 请求间间隔：遵守 rate limit
+      await delay(1000);
+    } catch (e) {
+      console.warn(
+        `[uptime-robot] Response time fetch failed for ${mon.name}:`,
+        e,
+      );
+    }
+  }
+
+  cacheSet("responseTimes", fresh);
+}
+
+/**
+ * 异步补拉响应时间（不阻塞主请求）。
+ * 在缓存命中的请求中调用，静默刷新过期数据。
+ */
+let rtRefreshRunning = false;
+
+async function fillResponseTimesAsync(
+  jwt: string,
+  monitors: FormattedMonitor[],
+): Promise<void> {
+  if (rtRefreshRunning) return;
+  rtRefreshRunning = true;
+
+  try {
+    const rtCache =
+      cacheGet<Record<number, CachedRT>>("responseTimes", 30 * 60 * 1000) || {};
+
+    const missing = monitors.filter((m) => !rtCache[m.id]);
+    if (missing.length === 0) {
+      rtRefreshRunning = false;
+      return;
+    }
+
+    const fresh: Record<number, CachedRT> = { ...rtCache };
+
+    for (const mon of missing) {
+      try {
+        const rt = await fetchOneResponseTime(jwt, mon.id);
+        fresh[mon.id] = {
+          responseTimes: (rt.time_series || []).map((ts) => ({
+            datetime: isoToUnix(ts.datetime),
+            value: toNum(ts.value),
+          })),
+          averageResponseTime: Math.round(rt.summary.avg),
+        };
+        await delay(1000);
+      } catch {
+        // 静默失败
+      }
+    }
+
+    cacheSet("responseTimes", fresh);
+  } finally {
+    rtRefreshRunning = false;
+  }
 }
 
 // ============================================================
