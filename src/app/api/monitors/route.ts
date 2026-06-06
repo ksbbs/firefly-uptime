@@ -41,7 +41,12 @@ export async function GET() {
     }));
 
     return NextResponse.json(
-      { monitors: sanitizedMonitors, overall, incidents: sanitizedIncidents },
+      {
+        monitors: sanitizedMonitors,
+        overall,
+        incidents: sanitizedIncidents,
+        _debug_incident: (globalThis as Record<string, unknown>).__uptime_debug_inc || null,
+      },
       {
         headers: {
           "Access-Control-Allow-Origin": "*",

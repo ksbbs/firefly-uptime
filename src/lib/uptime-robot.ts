@@ -177,19 +177,19 @@ async function fetchAllIncidents(jwt: string): Promise<V3IncidentItem[]> {
 
   const all = [...(json.data ?? [])];
 
-  // 🔍 诊断：打印第一个 incident 的关键字段
+  // 🔍 暂存供外部调试（route.ts 会读取并返回给客户端）
+  const gDebug = (globalThis as Record<string, unknown>);
   if (all.length > 0) {
-    const i = all[0] as Record<string, unknown>;
-    console.log(`[DIAG-INC] count=${all.length} keys=${Object.keys(i).join(",")} mon=${JSON.stringify(i.monitor)} type=${JSON.stringify(i.type)} status=${JSON.stringify(i.status)} startedAt=${JSON.stringify(i.startedAt)} duration=${i.duration} reason=${JSON.stringify(i.reason)}`);
+    gDebug.__uptime_debug_inc = all[0];
   } else {
-    console.log("[DIAG-INC] No incidents returned from API");
+    gDebug.__uptime_debug_inc = { _empty: true, _reason: "No incidents returned" };
   }
 
-  // 如果分页未结束，继续拉取（最多额外 2 页，避免过多调用）
+  // 分页（最多额外 2 页）
   let nextUrl = json.nextLink;
   let extraPages = 0;
   while (nextUrl && extraPages < 2) {
-    await delay(1000); // 翻页间隔
+    await delay(1000);
     const page = await v3Fetch<{ nextLink: string | null; data: V3IncidentItem[] }>(
       nextUrl,
       jwt,
