@@ -60,7 +60,7 @@ function calcUptimeFromIncidents(
   let totalDowntime = 0;
 
   for (const inc of incidents) {
-    if (inc.type !== "DOWNTIME") continue;
+    if (inc.type?.toLowerCase() !== "downtime") continue;
 
     const start = isoToUnix(inc.startedAt);
     const end = inc.resolvedAt ? isoToUnix(inc.resolvedAt) : now;
@@ -177,14 +177,6 @@ async function fetchAllIncidents(jwt: string): Promise<V3IncidentItem[]> {
 
   const all = [...(json.data ?? [])];
 
-  // 🔍 暂存供外部调试（route.ts 会读取并返回给客户端）
-  const gDebug = (globalThis as Record<string, unknown>);
-  if (all.length > 0) {
-    gDebug.__uptime_debug_inc = all[0];
-  } else {
-    gDebug.__uptime_debug_inc = { _empty: true, _reason: "No incidents returned" };
-  }
-
   // 分页（最多额外 2 页）
   let nextUrl = json.nextLink;
   let extraPages = 0;
@@ -255,7 +247,9 @@ export async function fetchMonitors(
   const monitors: FormattedMonitor[] = monitorItems.map((item) => {
     // 该 monitor 的 DOWNTIME 事件
     const monIncidents = allIncidents.filter(
-      (inc) => inc.monitor.id === item.id && inc.type === "DOWNTIME",
+      (inc) =>
+        inc.monitor.id === item.id &&
+        inc.type?.toLowerCase() === "downtime",
     );
 
     // 本地计算 7d / 30d / 90d uptime
