@@ -177,6 +177,15 @@ async function fetchAllIncidents(jwt: string): Promise<V3IncidentItem[]> {
 
   const all = [...(json.data ?? [])];
 
+  // 🔍 诊断：打印第一个 incident 的原始结构
+  if (all.length > 0) {
+    console.log("[DIAG-INC] First incident raw structure:", JSON.stringify(all[0], null, 2));
+    console.log("[DIAG-INC] First incident keys:", Object.keys(all[0]));
+    console.log("[DIAG-INC] Total incidents fetched:", all.length);
+  } else {
+    console.log("[DIAG-INC] No incidents returned from API");
+  }
+
   // 如果分页未结束，继续拉取（最多额外 2 页，避免过多调用）
   let nextUrl = json.nextLink;
   let extraPages = 0;
