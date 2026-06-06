@@ -193,8 +193,6 @@ export interface FormattedMonitor {
   responseTimes: { datetime: number; value: number }[];
   /** DOWN events */
   downEvents: MonitorLog[];
-  /** 数据来源标识，默认 "uptime-robot"，合成 monitor 可设为 "deepseek-feed" */
-  source?: "uptime-robot" | "deepseek-feed";
 }
 
 export interface Incident {
@@ -206,8 +204,6 @@ export interface Incident {
   duration: number;
   isOngoing: boolean;
   reason?: string;
-  /** 数据来源标识，默认 "uptime-robot" */
-  source?: "uptime-robot" | "deepseek-feed";
 }
 
 export interface OverallStatus {

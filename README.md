@@ -12,7 +12,6 @@
 - 🔍 **搜索和筛选** — 按名称搜索，按状态（全部/正常/异常/暂停）筛选
 - ⏰ **事件时间线** — 过去 90 天宕机事件记录
 - 🔄 **自动刷新** — 每 30 秒轮询最新状态
-- 🤖 **DeepSeek 状态页集成** — 同步展示 [status.deepseek.com](https://status.deepseek.com) 的官方事件流，无需在 Uptime Robot 添加额外 monitor
 - 🌙 **深色模式** — 萤火虫主题暗色设计
 - 📱 **响应式布局** — 桌面和移动端均可正常使用
 
@@ -73,7 +72,7 @@ src/
 │   ├── layout.tsx               # 根布局
 │   └── page.tsx                 # 主页面
 ├── components/
-│   ├── IncidentTimeline.tsx     # 事件时间线（区分 UptimeRobot / DeepSeek 来源）
+│   ├── IncidentTimeline.tsx     # 事件时间线
 │   ├── MiniHistoryBar.tsx       # 迷你历史趋势条
 │   ├── MonitorCard.tsx          # 监控卡片（点击查看详情）
 │   ├── MonitorDetail.tsx        # 监控详情弹窗
@@ -82,13 +81,12 @@ src/
 │   └── StatusHeader.tsx         # 状态头部汇总
 └── lib/
     ├── types.ts                 # 类型定义 + v3 状态映射
-    ├── uptime-robot.ts          # v3 REST API 客户端（三级缓存 + 请求去重）
-    └── deepseek-status.ts       # DeepSeek 状态页 atom feed 解析 + 缓存
+    └── uptime-robot.ts          # v3 REST API 客户端
 ```
 
 ## API 版本说明
 
-主要使用 **Uptime Robot v3 REST API**：
+使用 **Uptime Robot v3 REST API**：
 
 - **Base URL**: `https://api.uptimerobot.com/v3`
 - **认证**: `Authorization: Bearer <JWT>`
@@ -98,17 +96,6 @@ src/
   - `GET /monitors/{id}/stats/response-time` — 响应时间数据
   - `GET /incidents` — 宕机事件
 - **缓存**: 服务端 ISR 30 秒，CDN 缓存
-
-### 附加数据源
-
-#### DeepSeek 状态页
-
-- **数据源**: `https://status.deepseek.com/feed.atom`（写死，无环境变量）
-- **解析方式**: 手写 atom 解析器，无外部依赖
-- **状态推断**: 最新 entry（7 天内）`status=resolved` → UP；`investigating|identified|monitoring` → DOWN
-- **缓存**: 30 分钟 `globalThis` 内存缓存（与 UptimeRobot 一致）
-- **失败处理**: 拉取失败时返回 `NOT_CHECKED_YET`，不影响主数据流
-- **注意**: DeepSeek 状态页标准 `/api/v2/*.json` 端点全部 404（FlashDuty 包装层），只能使用 atom/rss feed
 
 ## 许可证
 

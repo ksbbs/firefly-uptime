@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
 import { fetchMonitors, getOverallStatus, getIncidents } from "@/lib/uptime-robot";
-import { fetchDeepSeekSnapshot } from "@/lib/deepseek-status";
 
 export async function GET() {
   const jwt = process.env.UPTIME_ROBOT_JWT;
@@ -16,14 +15,7 @@ export async function GET() {
   }
 
   try {
-    // UptimeRobot 与 DeepSeek 状态页独立抓取，DeepSeek 失败不影响主数据流
-    const [monitors, deepseek] = await Promise.all([
-      fetchMonitors(jwt),
-      fetchDeepSeekSnapshot().catch((e) => {
-        console.warn("[deepseek-status] snapshot failed:", e);
-        return null;
-      }),
-    ]);
+    const monitors = await fetchMonitors(jwt);
 
     // 诊断日志：验证 uptime 比率数据是否正确获取
     if (monitors.length > 0) {
@@ -35,26 +27,15 @@ export async function GET() {
       );
     }
 
-    // 合并 monitors（DeepSeek 合成 monitor 追加在末尾）
-    const allMonitors = deepseek
-      ? [...monitors, deepseek.monitor]
-      : monitors;
-
-    // 合并 incidents（UptimeRobot 历史 + DeepSeek feed），按时间倒序，取前 50
-    const allIncidents = deepseek
-      ? [...getIncidents(monitors), ...deepseek.incidents]
-          .sort((a, b) => b.datetime - a.datetime)
-          .slice(0, 50)
-      : getIncidents(monitors);
-
-    const overall = getOverallStatus(allMonitors);
+    const overall = getOverallStatus(monitors);
+    const incidents = getIncidents(monitors);
 
     // 剥离敏感字段（IP、URL 等）后再返回客户端
-    const sanitizedMonitors = allMonitors.map((m) => {
+    const sanitizedMonitors = monitors.map((m) => {
       const { url: _url, ...rest } = m;
       return rest;
     });
-    const sanitizedIncidents = allIncidents.map((inc) => ({
+    const sanitizedIncidents = incidents.map((inc) => ({
       ...inc,
       monitorUrl: "",
     }));
