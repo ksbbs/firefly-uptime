@@ -16,9 +16,14 @@ export default function ResponseTimeChart({ data }: ResponseTimeChartProps) {
   const values = data.map((d) => d.value);
   const max = Math.max(...values, 1);
   const min = Math.min(...values, 0);
-  const range = max - min || 1;
   const avg = Math.round(values.reduce((a, b) => a + b, 0) / values.length);
   const latest = values[values.length - 1];
+
+  // Y 轴裁剪：用 P95 避免单个超时极值拉平整个图表
+  const sorted = [...values].sort((a, b) => a - b);
+  const p95 = sorted[Math.floor(sorted.length * 0.95)];
+  const chartMax = Math.max(p95, avg * 1.5, 1);
+  const isTruncated = max > chartMax;
 
   const barCount = data.length;
   const chartHeight = 120;
@@ -27,7 +32,6 @@ export default function ResponseTimeChart({ data }: ResponseTimeChartProps) {
     if (ts > 0) {
       return new Date(ts * 1000).toLocaleString("zh-CN");
     }
-    // 合成时间戳：从末尾往前推算
     const minutesAgo = (barCount - 1 - index) * 5;
     if (minutesAgo === 0) return "最近一次检查";
     if (minutesAgo < 60) return `${minutesAgo} 分钟前`;
@@ -64,12 +68,16 @@ export default function ResponseTimeChart({ data }: ResponseTimeChartProps) {
         </div>
       </div>
 
-      {/* Chart — responsive SVG, no scrollbar */}
+      {/* Chart — Y 轴裁剪到 chartMax，超出部分截断显示 */}
       <div className="relative pl-8">
         {/* Y-axis labels */}
         <div className="absolute left-0 top-0 bottom-0 flex flex-col justify-between pointer-events-none">
-          <span className="text-[10px] text-text-muted -translate-y-1">{max}ms</span>
-          <span className="text-[10px] text-text-muted">{Math.round((max + min) / 2)}ms</span>
+          <span className="text-[10px] text-text-muted -translate-y-1">
+            {isTruncated ? `${Math.round(chartMax)}+` : `${max}`}ms
+          </span>
+          <span className="text-[10px] text-text-muted">
+            {Math.round(chartMax / 2)}ms
+          </span>
           <span className="text-[10px] text-text-muted translate-y-1">{min}ms</span>
         </div>
 
@@ -91,7 +99,8 @@ export default function ResponseTimeChart({ data }: ResponseTimeChartProps) {
 
           {/* Bars */}
           {data.map((d, i) => {
-            const barH = Math.max(2, (d.value / range) * chartHeight);
+            const displayVal = Math.min(d.value, chartMax);
+            const barH = Math.max(2, (displayVal / chartMax) * chartHeight);
             const x = i * 10;
             const y = chartHeight - barH;
 
@@ -110,23 +119,49 @@ export default function ResponseTimeChart({ data }: ResponseTimeChartProps) {
                   fill={color}
                   className="transition-all duration-200 hover:opacity-80"
                 />
+                {/* 截断标记：超出上界时顶部画红线提示 */}
+                {d.value > chartMax && (
+                  <line
+                    x1={x + 1}
+                    y1={y}
+                    x2={x + 7}
+                    y2={y}
+                    stroke="rgba(239, 68, 68, 0.9)"
+                    strokeWidth="1.5"
+                  />
+                )}
                 <title>
-                  {`${formatTooltipTime(d.datetime, i)}: ${d.value}ms`}
+                  {`${formatTooltipTime(d.datetime, i)}: ${d.value}ms${d.value > chartMax ? " (已截断)" : ""}`}
                 </title>
               </g>
             );
           })}
 
+          {/* 截断分隔线（提醒视图已被裁剪） */}
+          {isTruncated && (
+            <line
+              x1="0" y1="1" x2={barCount * 10} y2="1"
+              stroke="rgba(239, 68, 68, 0.2)"
+              strokeWidth="1"
+              strokeDasharray="4 4"
+            />
+          )}
+
           {/* Average line */}
           <line
-            x1="0" y1={chartHeight - (avg / range) * chartHeight}
-            x2={barCount * 10} y2={chartHeight - (avg / range) * chartHeight}
+            x1="0" y1={chartHeight - (avg / chartMax) * chartHeight}
+            x2={barCount * 10} y2={chartHeight - (avg / chartMax) * chartHeight}
             stroke="rgba(245, 158, 11, 0.4)"
             strokeWidth="1"
             strokeDasharray="6 3"
           />
         </svg>
 
+        {isTruncated && (
+          <p className="text-[10px] text-down/80 text-right mt-1">
+            Y 轴截断于 P95 · 实际最大值 {max}ms
+          </p>
+        )}
         <p className="text-[10px] text-text-muted text-right mt-1">
           平均线 — {avg}ms
         </p>
