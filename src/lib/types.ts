@@ -71,70 +71,108 @@ export interface UptimeRatios {
 }
 
 // ============================================================
-// v3 API raw response types
+// v3 API 原始响应类型（与 UptimeRobot v3 OpenAPI 一致）
 // ============================================================
 
-export type V3LogType = "down" | "up";
-export type V3MonitorStatus = "up" | "down" | "paused" | "seems_down" | "not_checked_yet";
-export type V3MonitorType = "http" | "keyword" | "ping" | "port" | "heartbeat" | "dns";
-
-export interface V3MonitorLog {
+/** GET /monitors 响应: data[] 中的单个 monitor（基本字段） */
+export interface V3MonitorListItem {
   id: number;
-  type: V3LogType;
-  datetime: string; // ISO 8601
-  duration: number;
-  reason?: { code: string; detail: string };
-}
-
-export interface V3ResponseTime {
-  datetime: string; // ISO 8601
-  value: number;
-}
-
-export interface V3Monitor {
-  id: number;
-  friendly_name: string;
+  friendlyName: string;
   url: string;
-  type: V3MonitorType;
-  sub_type?: string | null;
-  keyword_type?: string | null;
-  keyword_value?: string | null;
-  http_method?: number | null;
-  http_username?: string | null;
-  http_password?: string | null;
-  port?: number | null;
+  type: number;
+  status: string; // "UP" | "DOWN" | "LOOKS_DOWN" | "PAUSED" | "STARTED"
   interval: number;
-  status: V3MonitorStatus;
-  create_datetime: string;
-  logs?: V3MonitorLog[];
-  custom_uptime_ratio?: number;
-  custom_uptime_ratios?: string;
-  custom_uptime_ranges?: string;
-  average_response_time?: number;
-  response_times?: V3ResponseTime[];
 }
 
-export interface V3MonitorResponse {
-  data: V3Monitor[];
-  pagination: {
-    cursor?: string;
-    has_more: boolean;
+export interface V3MonitorsResponse {
+  nextLink: string | null;
+  data: V3MonitorListItem[];
+}
+
+/** GET /monitors/{id}/stats/uptime 响应 */
+export interface V3UptimeStats {
+  uptime: number; // 0-100
+  total_downtime_seconds: number;
+  incident_count: number;
+  mtbf: number | null;
+  from: string; // ISO 8601
+  to: string; // ISO 8601
+}
+
+/** GET /monitors/{id}/stats/response-time 响应 */
+export interface V3ResponseTimeStats {
+  from: string;
+  to: string;
+  summary: {
+    avg: number;
+    min: number;
+    max: number;
+  };
+  data_points: number;
+  time_series?: Array<{
+    datetime: string;
+    value: number;
+  }>;
+}
+
+/** GET /incidents 响应: data[] 中的单个 incident */
+export interface V3IncidentItem {
+  id: string;
+  status: string; // "ONGOING" | "RESOLVED"
+  type: string; // "DOWNTIME" | "SLOW_RESPONSE"
+  reason: string;
+  duration: number | null;
+  startedAt: string; // ISO 8601
+  resolvedAt: string | null;
+  monitor: {
+    id: number;
+    friendlyName: string;
   };
 }
 
-export function v3StatusToInternal(status: V3MonitorStatus): MonitorStatus {
+export interface V3IncidentsResponse {
+  nextLink: string | null;
+  data: V3IncidentItem[];
+}
+
+// ============================================================
+// v3 状态映射
+// ============================================================
+
+/** 将 v3 字符串状态映射为内部 numeric status */
+export function v3StatusToInternal(status: string): MonitorStatus {
   switch (status) {
-    case "up": return MONITOR_STATUS.UP;
-    case "down": return MONITOR_STATUS.DOWN;
-    case "seems_down": return MONITOR_STATUS.SEEMS_DOWN;
-    case "paused": return MONITOR_STATUS.PAUSED;
-    case "not_checked_yet": return MONITOR_STATUS.NOT_CHECKED_YET;
-    default: return MONITOR_STATUS.NOT_CHECKED_YET;
+    case "UP":
+      return MONITOR_STATUS.UP;
+    case "DOWN":
+      return MONITOR_STATUS.DOWN;
+    case "LOOKS_DOWN":
+      return MONITOR_STATUS.SEEMS_DOWN;
+    case "PAUSED":
+      return MONITOR_STATUS.PAUSED;
+    case "STARTED":
+      return MONITOR_STATUS.NOT_CHECKED_YET;
+    default:
+      return MONITOR_STATUS.NOT_CHECKED_YET;
   }
 }
 
-export function v3LogTypeToInternal(type: V3LogType): number {
-  return type === "down" ? LOG_TYPE.DOWN : LOG_TYPE.UP;
+/** 将 v3 字符串状态映射为显示标签 */
+export function v3StatusToLabel(status: string): string {
+  switch (status) {
+    case "UP":
+      return "Up";
+    case "DOWN":
+      return "Down";
+    case "LOOKS_DOWN":
+      return "Seems Down";
+    case "PAUSED":
+      return "Paused";
+    case "STARTED":
+      return "Pending";
+    default:
+      return "Unknown";
+  }
 }
 
 // ============================================================

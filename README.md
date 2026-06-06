@@ -10,7 +10,7 @@
 - 🗺️ **迷你历史趋势图** — 每服务最近 7 天宕机趋势预览
 - 📉 **响应时间图表** — 点击卡片查看详细响应时间柱状图
 - 🔍 **搜索和筛选** — 按名称搜索，按状态（全部/正常/异常/暂停）筛选
-- ⏰ **事件时间线** — 过去 30 天宕机事件记录
+- ⏰ **事件时间线** — 过去 90 天宕机事件记录
 - 🔄 **自动刷新** — 每 30 秒轮询最新状态
 - 🌙 **深色模式** — 萤火虫主题暗色设计
 - 📱 **响应式布局** — 桌面和移动端均可正常使用
@@ -22,7 +22,7 @@
 | **框架** | Next.js 15 (App Router) |
 | **语言** | TypeScript |
 | **样式** | Tailwind CSS v4 |
-| **API** | Uptime Robot API v3（降级兼容 v2） |
+| **API** | Uptime Robot API v3 |
 | **部署** | Vercel |
 
 ## 部署
@@ -38,16 +38,11 @@ git clone <your-fork-url>
 cd firefly-uptime
 ```
 
-### 2. 获取 Uptime Robot 认证信息
+### 2. 获取 Uptime Robot v3 认证信息
 
-**v3（推荐）：** 
 1. 登录 [Uptime Robot Dashboard](https://dashboard.uptimerobot.com/)
 2. 进入 **Integrations** → **API** → **Create JWT**
 3. 复制 JWT Token
-
-**v2（降级方案）：**
-1. 进入 **My Settings** → **API Settings**
-2. 创建 Read-only API Key
 
 ### 3. 配置环境变量
 
@@ -55,15 +50,14 @@ cd firefly-uptime
 
 | 变量 | 必填 | 说明 |
 |------|------|------|
-| `UPTIME_ROBOT_JWT` | 推荐 | v3 JWT Bearer Token（优先级高） |
-| `UPTIME_ROBOT_API_KEY` | 备选 | v2 只读 API Key（v3 不可用时的降级） |
+| `UPTIME_ROBOT_JWT` | 是 | v3 JWT Bearer Token |
 
 ### 4. 本地开发
 
 ```bash
 npm install
 cp .env.example .env.local
-# 编辑 .env.local 填入认证信息
+# 编辑 .env.local 填入 UPTIME_ROBOT_JWT
 
 npm run dev
 ```
@@ -73,7 +67,7 @@ npm run dev
 ```
 src/
 ├── app/
-│   ├── api/monitors/route.ts    # API 代理路由（v3 优先，v2 降级）
+│   ├── api/monitors/route.ts    # API 代理路由（v3 JWT）
 │   ├── globals.css              # 全局样式 + Tailwind + 动画
 │   ├── layout.tsx               # 根布局
 │   └── page.tsx                 # 主页面
@@ -86,20 +80,22 @@ src/
 │   ├── SearchFilter.tsx         # 搜索和筛选
 │   └── StatusHeader.tsx         # 状态头部汇总
 └── lib/
-    ├── types.ts                 # 类型定义 + v3/v2 映射
-    ├── uptime-robot.ts          # 主 API 客户端（v3 + v2 降级）
-    └── uptime-robot-v3.ts       # v3 REST API 客户端
+    ├── types.ts                 # 类型定义 + v3 状态映射
+    └── uptime-robot.ts          # v3 REST API 客户端
 ```
 
 ## API 版本说明
 
-当前版本默认使用 **v3 REST API**：
+使用 **Uptime Robot v3 REST API**：
+
 - **Base URL**: `https://api.uptimerobot.com/v3`
 - **认证**: `Authorization: Bearer <JWT>`
-- **端点**: `GET /monitors`（RESTful）
-- **响应**: JSON，状态字段为描述性字符串（如 `"up"`, `"down"`）
-
-如未配置 v3 JWT，自动降级到 **v2 API**。
+- **端点**:
+  - `GET /monitors` — monitor 列表
+  - `GET /monitors/{id}/stats/uptime` — uptime 统计（7d/30d/90d）
+  - `GET /monitors/{id}/stats/response-time` — 响应时间数据
+  - `GET /incidents` — 宕机事件
+- **缓存**: 服务端 ISR 30 秒，CDN 缓存
 
 ## 许可证
 

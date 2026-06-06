@@ -2,24 +2,20 @@ import { NextResponse } from "next/server";
 import { fetchMonitors, getOverallStatus, getIncidents } from "@/lib/uptime-robot";
 
 export async function GET() {
-  // 优先使用 v3 JWT Token
   const jwt = process.env.UPTIME_ROBOT_JWT;
-  const apiKey = process.env.UPTIME_ROBOT_API_KEY;
 
-  if (!jwt && !apiKey) {
+  if (!jwt) {
     return NextResponse.json(
       {
         error: "未配置 API 认证信息",
-        hint: "请在 Vercel 环境变量中设置 UPTIME_ROBOT_JWT (v3) 或 UPTIME_ROBOT_API_KEY (v2)",
+        hint: "请在 Vercel 环境变量中设置 UPTIME_ROBOT_JWT（v3 JWT Bearer Token）",
       },
-      { status: 500 }
+      { status: 500 },
     );
   }
 
   try {
-    const monitors = jwt
-      ? await fetchMonitors(jwt, true) // v3
-      : await fetchMonitors(apiKey!, false); // v2 降级
+    const monitors = await fetchMonitors(jwt);
 
     // 诊断日志：验证 uptime 比率数据是否正确获取
     if (monitors.length > 0) {
@@ -27,14 +23,14 @@ export async function GET() {
       console.log(
         `[DIAG] uptimeRatios for "${firstMonitor.name}":`,
         JSON.stringify(firstMonitor.uptimeRatios),
-        `downEvents: ${firstMonitor.downEvents.length}`
+        `downEvents: ${firstMonitor.downEvents.length}`,
       );
     }
 
     const overall = getOverallStatus(monitors);
     const incidents = getIncidents(monitors);
 
-    // 剥离敏感字段（IP、URL、端口等）后再返回客户端
+    // 剥离敏感字段（IP、URL 等）后再返回客户端
     const sanitizedMonitors = monitors.map((m) => {
       const { url: _url, ...rest } = m;
       return rest;
@@ -51,16 +47,13 @@ export async function GET() {
           "Access-Control-Allow-Origin": "*",
           "Cache-Control": "public, s-maxage=30, stale-while-revalidate=60",
         },
-      }
+      },
     );
   } catch (error) {
     console.error("Failed to fetch monitors:", error);
     const message =
       error instanceof Error ? error.message : "Unknown error";
-    return NextResponse.json(
-      { error: message },
-      { status: 502 }
-    );
+    return NextResponse.json({ error: message }, { status: 502 });
   }
 }
 
