@@ -177,11 +177,10 @@ async function fetchAllIncidents(jwt: string): Promise<V3IncidentItem[]> {
 
   const all = [...(json.data ?? [])];
 
-  // 🔍 诊断：打印第一个 incident 的原始结构
+  // 🔍 诊断：打印第一个 incident 的关键字段
   if (all.length > 0) {
-    console.log("[DIAG-INC] First incident raw structure:", JSON.stringify(all[0], null, 2));
-    console.log("[DIAG-INC] First incident keys:", Object.keys(all[0]));
-    console.log("[DIAG-INC] Total incidents fetched:", all.length);
+    const i = all[0] as Record<string, unknown>;
+    console.log(`[DIAG-INC] count=${all.length} keys=${Object.keys(i).join(",")} mon=${JSON.stringify(i.monitor)} type=${JSON.stringify(i.type)} status=${JSON.stringify(i.status)} startedAt=${JSON.stringify(i.startedAt)} duration=${i.duration} reason=${JSON.stringify(i.reason)}`);
   } else {
     console.log("[DIAG-INC] No incidents returned from API");
   }
