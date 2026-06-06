@@ -72,9 +72,9 @@ export default function MonitorDetail({
       />
 
       {/* Panel */}
-      <div className="relative w-full sm:max-w-2xl sm:mx-4 max-h-[85vh] sm:max-h-[80vh] bg-bg-card border border-border rounded-t-2xl sm:rounded-2xl overflow-hidden animate-slide-up shadow-2xl">
+      <div className="relative w-full sm:max-w-2xl sm:mx-4 max-h-[85vh] sm:max-h-[80vh] bg-bg-card border border-border rounded-t-2xl sm:rounded-2xl overflow-hidden animate-slide-up shadow-2xl flex flex-col">
         {/* Header */}
-        <div className="sticky top-0 bg-bg-card border-b border-border px-5 py-4 flex items-center justify-between z-10">
+        <div className="bg-bg-card border-b border-border px-5 py-4 flex items-center justify-between z-10">
           <div className="flex items-center gap-3">
             <div
               className={`w-3 h-3 rounded-full ${
@@ -117,7 +117,7 @@ export default function MonitorDetail({
         </div>
 
         {/* Body */}
-        <div className="overflow-y-auto p-5 space-y-6">
+        <div className="overflow-y-auto p-5 space-y-6 flex-1 min-h-0">
           {/* Quick Stats */}
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
             <div className="p-3 rounded-xl bg-bg-primary/50 border border-border/50">
