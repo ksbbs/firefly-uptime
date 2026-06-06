@@ -85,14 +85,12 @@ interface CacheEntry<T> {
   timestamp: number;
 }
 
-function cacheGet<T>(key: string, ttlMs: number): T | null {
+function cacheGet<T>(key: string): CacheEntry<T> | null {
   const store = (globalThis as Record<string, unknown>).__uptimeCache as
     | Record<string, CacheEntry<T>>
     | undefined;
   if (!store) return null;
-  const entry = store[key];
-  if (entry && Date.now() - entry.timestamp < ttlMs) return entry.data;
-  return null;
+  return store[key] ?? null;
 }
 
 function cacheSet<T>(key: string, data: T): void {
@@ -102,6 +100,16 @@ function cacheSet<T>(key: string, data: T): void {
     data,
     timestamp: Date.now(),
   };
+}
+
+/** 缓存是否在 TTL 内 */
+function isFresh(entry: CacheEntry<unknown> | null, ttlMs: number): boolean {
+  return !!entry && Date.now() - entry.timestamp < ttlMs;
+}
+
+/** 是否有可用的旧数据（用于 stale-while-revalidate） */
+function isStale(entry: CacheEntry<unknown> | null, ttlMs: number): boolean {
+  return !!entry && Date.now() - entry.timestamp < ttlMs * 3;
 }
 
 // ============================================================
@@ -211,30 +219,67 @@ async function fetchOneResponseTime(
 }
 
 // ============================================================
+// 请求去重（同一时刻只允许一个 in-flight 请求）
+// ============================================================
+
+const g = globalThis as Record<string, unknown>;
+let inflightPromise: Promise<FormattedMonitor[]> | null =
+  (g.__uptimeInflight as Promise<FormattedMonitor[]> | null) || null;
+
+// ============================================================
 // 主入口：2 次 API 调用 + 本地计算 uptime
 // ============================================================
 
 /**
  * 使用 v3 API 获取全部数据。
  *
- * API 调用数（最小化以遵守 10 req/min 限制）：
- *   1. GET /monitors?limit=200         → 基本列表
- *   2. GET /incidents?limit=500        → 全部宕机事件（从中计算 uptime 比率）
- *   3. GET /monitors/{id}/stats/response-time  → 仅响应时间缓存过期时逐 monitor 串行
+ * 缓存策略（三级）：
+ *   FRESH  (< 10 min)：直接返回，零 API 调用
+ *   STALE  (10-30 min)：返回旧数据 + 后台异步刷新（不阻塞）
+ *   COLD   (> 30 min / 未缓存)：阻塞刷新，同时去重并发请求
  *
- * 结果缓存在 globalThis 内存中，warm instance 期间秒返。
+ * 响应时间独立缓存 60 分钟。
  */
 export async function fetchMonitors(
   jwt: string,
 ): Promise<FormattedMonitor[]> {
-  // ── 检查缓存 ──────────────────────────────────────────────
-  const cached = cacheGet<FormattedMonitor[]>("monitors", 5 * 60 * 1000);
-  if (cached) {
-    // 后台补拉响应时间（如果过期）
-    fillResponseTimesAsync(jwt, cached);
-    return cached;
+  const MONITORS_TTL = 10 * 60 * 1000; // 10 分钟
+
+  // ── Tier 1: FRESH 缓存 → 秒返 ─────────────────────────────
+  const entry = cacheGet<FormattedMonitor[]>("monitors");
+  if (isFresh(entry, MONITORS_TTL) && entry) {
+    fillResponseTimesAsync(jwt, entry.data);
+    return entry.data;
   }
 
+  // ── Tier 2: STALE 缓存 → 先返旧数据，后台刷新 ──────────────
+  if (isStale(entry, MONITORS_TTL) && entry) {
+    // 后台刷新（不 await，不阻塞）
+    refreshInBackground(jwt);
+    fillResponseTimesAsync(jwt, entry.data);
+    return entry.data;
+  }
+
+  // ── Tier 3: COLD → 必须刷新，但先去重 ─────────────────────
+  if (inflightPromise) {
+    console.log("[uptime-robot] Dedup: waiting for in-flight request");
+    return inflightPromise;
+  }
+
+  inflightPromise = doFetchMonitors(jwt);
+  g.__uptimeInflight = inflightPromise;
+
+  try {
+    const result = await inflightPromise;
+    return result;
+  } finally {
+    inflightPromise = null;
+    g.__uptimeInflight = null;
+  }
+}
+
+/** 实际执行 API 调用的内部函数 */
+async function doFetchMonitors(jwt: string): Promise<FormattedMonitor[]> {
   // ── Step 1 + 2：并行获取 monitor 列表 & incidents ──────────
   const [monitorItems, allIncidents] = await Promise.all([
     fetchMonitorList(jwt),
@@ -245,21 +290,18 @@ export async function fetchMonitors(
 
   // ── 构建 FormattedMonitor（uptime 从 incidents 本地计算）───
   const monitors: FormattedMonitor[] = monitorItems.map((item) => {
-    // 该 monitor 的 DOWNTIME 事件
     const monIncidents = allIncidents.filter(
       (inc) =>
         inc.monitor.id === item.id &&
         inc.type?.toLowerCase() === "downtime",
     );
 
-    // 本地计算 7d / 30d / 90d uptime
     const uptimeRatios: UptimeRatios = {
       ratio7d: calcUptimeFromIncidents(monIncidents, 7, now),
       ratio30d: calcUptimeFromIncidents(monIncidents, 30, now),
       ratio90d: calcUptimeFromIncidents(monIncidents, 90, now),
     };
 
-    // 构建 downEvents / logs
     const downEvents: MonitorLog[] = monIncidents.map((inc) => ({
       id: parseInt(inc.id, 10) || 0,
       type: LOG_TYPE.DOWN,
@@ -294,9 +336,26 @@ export async function fetchMonitors(
   return monitors;
 }
 
+/** 后台异步刷新（不阻塞当前请求） */
+let bgRefreshRunning = false;
+async function refreshInBackground(jwt: string): Promise<void> {
+  if (bgRefreshRunning || inflightPromise) return;
+  bgRefreshRunning = true;
+  try {
+    console.log("[uptime-robot] Background refresh started");
+    await doFetchMonitors(jwt);
+  } catch (e) {
+    console.warn("[uptime-robot] Background refresh failed:", e);
+  } finally {
+    bgRefreshRunning = false;
+  }
+}
+
 // ============================================================
-// 响应时间（独立缓存，30 分钟 TTL）
+// 响应时间（独立缓存，60 分钟 TTL）
 // ============================================================
+
+const RT_TTL = 60 * 60 * 1000; // 60 分钟
 
 interface CachedRT {
   responseTimes: { datetime: number; value: number }[];
@@ -307,9 +366,10 @@ async function fillResponseTimes(
   jwt: string,
   monitors: FormattedMonitor[],
 ): Promise<void> {
-  // 尝试从独立缓存恢复
-  const rtCache =
-    cacheGet<Record<number, CachedRT>>("responseTimes", 30 * 60 * 1000) || {};
+  // 尝试从独立缓存恢复（FRESH + STALE 都可接受）
+  const rtEntry = cacheGet<Record<number, CachedRT>>("responseTimes");
+  const rtCache: Record<number, CachedRT> =
+    isStale(rtEntry, RT_TTL) && rtEntry ? rtEntry.data : {};
 
   let restored = 0;
   for (const mon of monitors) {
@@ -321,8 +381,14 @@ async function fillResponseTimes(
     }
   }
 
-  // 缓存完整命中 → 不需要 API 调用
-  if (restored === monitors.length) return;
+  // FRESH 且全命中 → 零 API 调用
+  if (restored === monitors.length && isFresh(rtEntry, RT_TTL)) return;
+
+  // STALE 但全命中 → 返回旧数据，后台补拉
+  if (restored === monitors.length) {
+    fillResponseTimesAsync(jwt, monitors);
+    return;
+  }
 
   // 缓存缺失 → 串行拉取（每秒 1 次，遵守 rate limit）
   const fresh: Record<number, CachedRT> = { ...rtCache };
@@ -376,7 +442,7 @@ async function fillResponseTimesAsync(
 
   try {
     const rtCache =
-      cacheGet<Record<number, CachedRT>>("responseTimes", 30 * 60 * 1000) || {};
+      cacheGet<Record<number, CachedRT>>("responseTimes")?.data || {};
 
     const missing = monitors.filter((m) => !rtCache[m.id]);
     if (missing.length === 0) {
