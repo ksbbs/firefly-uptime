@@ -113,6 +113,11 @@ export default function IncidentTimeline({
                   <span className="text-text-primary text-sm font-medium">
                     {incident.monitorName}
                   </span>
+                  {incident.source === "deepseek-feed" && (
+                    <span className="px-1.5 py-0.5 rounded text-xs font-medium bg-accent/15 text-accent border border-accent/30">
+                      DeepSeek
+                    </span>
+                  )}
                   <span
                     className={`px-1.5 py-0.5 rounded text-xs font-medium ${
                       incident.isOngoing
