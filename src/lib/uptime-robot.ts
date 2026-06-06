@@ -36,9 +36,7 @@ interface UptimeRobotMonitor {
   interval?: number;
   status: MonitorStatus;
   logs?: V2MonitorLog[];
-  custom_uptime_ratio?: number;
-  custom_uptime_ratios?: string;
-  custom_uptime_ranges?: string;
+  custom_uptime_ratio?: string;
   average_response_time?: number;
   response_times?: V2ResponseTime[];
   create_datetime?: number;
@@ -172,7 +170,7 @@ function formatV2Monitor(monitor: UptimeRobotMonitor): FormattedMonitor {
     statusLabel: statusLabels[monitor.status] || "Unknown",
     monitorType: String(monitor.type),
     interval: monitor.interval ?? 300,
-    uptimeRatios: parseUptimeRanges(monitor.custom_uptime_ratios),
+    uptimeRatios: parseUptimeRanges(monitor.custom_uptime_ratio),
     averageResponseTime: toNum(monitor.average_response_time),
     logs: allLogs,
     responseTimes: (monitor.response_times || []).map((rt) => ({
