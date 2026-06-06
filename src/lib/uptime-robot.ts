@@ -125,7 +125,6 @@ function isStale(entry: CacheEntry<unknown> | null, ttlMs: number): boolean {
 async function v3Fetch<T>(
   url: string,
   jwt: string,
-  revalidateSeconds?: number,
 ): Promise<T> {
   const maxRetries = 3;
 
@@ -136,18 +135,14 @@ async function v3Fetch<T>(
         "Content-Type": "application/json",
       },
     };
-    if (revalidateSeconds !== undefined) {
-      (fetchOpts as Record<string, unknown>).next = {
-        revalidate: revalidateSeconds,
-      };
-    }
+    // 注意：API Route 中 Next.js Data Cache 不可用，仅依赖 globalThis 缓存
 
     const res = await fetch(url, fetchOpts);
 
     if (res.ok) return res.json() as Promise<T>;
 
     if (res.status === 429 && attempt < maxRetries) {
-      const backoff = Math.pow(2, attempt + 1) * 1000; // 2s, 4s, 8s
+      const backoff = Math.pow(2, attempt + 1) * 5000; // 10s, 20s, 40s
       console.warn(
         `[uptime-robot] 429 on ${url.split("?")[0].split("/v3")[1]}, ` +
           `retry in ${backoff / 1000}s (${attempt + 1}/${maxRetries})`,
@@ -169,7 +164,6 @@ async function fetchMonitorList(jwt: string): Promise<V3MonitorListItem[]> {
   const json = await v3Fetch<{ nextLink: string | null; data: V3MonitorListItem[] }>(
     `${API_BASE}/monitors?limit=200`,
     jwt,
-    30,
   );
   return json.data ?? [];
 }
@@ -180,7 +174,6 @@ async function fetchAllIncidents(jwt: string): Promise<V3IncidentItem[]> {
   const json = await v3Fetch<{ nextLink: string | null; data: V3IncidentItem[] }>(
     url,
     jwt,
-    60,
   );
 
   const all = [...(json.data ?? [])];
@@ -243,7 +236,7 @@ let inflightPromise: Promise<FormattedMonitor[]> | null =
 export async function fetchMonitors(
   jwt: string,
 ): Promise<FormattedMonitor[]> {
-  const MONITORS_TTL = 10 * 60 * 1000; // 10 分钟
+  const MONITORS_TTL = 30 * 60 * 1000; // 30 分钟
 
   // ── Tier 1: FRESH 缓存 → 秒返 ─────────────────────────────
   const entry = cacheGet<FormattedMonitor[]>("monitors");
@@ -280,11 +273,10 @@ export async function fetchMonitors(
 
 /** 实际执行 API 调用的内部函数 */
 async function doFetchMonitors(jwt: string): Promise<FormattedMonitor[]> {
-  // ── Step 1 + 2：并行获取 monitor 列表 & incidents ──────────
-  const [monitorItems, allIncidents] = await Promise.all([
-    fetchMonitorList(jwt),
-    fetchAllIncidents(jwt),
-  ]);
+  // ── Step 1 + 2：串行获取（不同时发送以避免触发 rate limit）──
+  const monitorItems = await fetchMonitorList(jwt);
+  await delay(1000);
+  const allIncidents = await fetchAllIncidents(jwt);
 
   const now = Math.floor(Date.now() / 1000);
 
@@ -355,7 +347,7 @@ async function refreshInBackground(jwt: string): Promise<void> {
 // 响应时间（独立缓存，60 分钟 TTL）
 // ============================================================
 
-const RT_TTL = 60 * 60 * 1000; // 60 分钟
+const RT_TTL = 120 * 60 * 1000; // 2 小时
 
 interface CachedRT {
   responseTimes: { datetime: number; value: number }[];
