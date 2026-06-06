@@ -90,11 +90,6 @@ export default function MonitorCard({ monitor, onClick }: MonitorCardProps) {
               {monitor.name}
             </h3>
           </div>
-          {monitor.url && (
-            <p className="text-text-muted text-xs truncate pl-5">
-              ---
-            </p>
-          )}
         </div>
         <div
           className={`px-2.5 py-1 rounded-full text-xs font-medium ${config.bg} ${config.text} ${config.border} border whitespace-nowrap`}

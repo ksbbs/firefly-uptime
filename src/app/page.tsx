@@ -130,11 +130,7 @@ export default function Home() {
 
     if (search) {
       const q = search.toLowerCase();
-      list = list.filter(
-        (m) =>
-          m.name.toLowerCase().includes(q) ||
-          m.url.toLowerCase().includes(q)
-      );
+      list = list.filter((m) => m.name.toLowerCase().includes(q));
     }
 
     switch (filter) {

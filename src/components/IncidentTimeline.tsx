@@ -10,20 +10,19 @@ interface IncidentTimelineProps {
 function formatTimestamp(ts: number): string {
   const d = new Date(ts * 1000);
   const now = new Date();
-  const diff = now.getTime() - d.getTime();
-  const diffDays = Math.floor(diff / (1000 * 60 * 60 * 24));
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const yesterday = new Date(today.getTime() - 86400000);
+  const eventDate = new Date(d.getFullYear(), d.getMonth(), d.getDate());
 
-  const dateStr = d.toLocaleDateString("zh-CN", {
+  const timeStr = d.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
+  if (eventDate.getTime() === today.getTime()) return `今天 ${timeStr}`;
+  if (eventDate.getTime() === yesterday.getTime()) return `昨天 ${timeStr}`;
+  return d.toLocaleDateString("zh-CN", {
     month: "short",
     day: "numeric",
     hour: "2-digit",
     minute: "2-digit",
   });
-
-  if (diffDays === 0) return `今天 ${d.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}`;
-  if (diffDays === 1) return `昨天 ${d.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}`;
-  if (diffDays < 7) return `${diffDays} 天前`;
-  return dateStr;
 }
 
 function formatDuration(seconds: number): string {
