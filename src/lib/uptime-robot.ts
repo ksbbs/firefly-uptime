@@ -105,57 +105,96 @@ function cacheSet<T>(key: string, data: T): void {
 }
 
 // ============================================================
-// v3 API 调用
+// v3 API 调用（带 429 重试 + 通用错误处理）
 // ============================================================
+
+/**
+ * 所有 v3 API 请求的通用封装：
+ * - 自动附加 JWT 认证头
+ * - 429 时指数退避重试（最多 3 次：2s/4s/8s）
+ * - 返回已解析的 JSON
+ */
+async function v3Fetch<T>(
+  url: string,
+  jwt: string,
+  revalidateSeconds?: number,
+): Promise<T> {
+  const maxRetries = 3;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const fetchOpts: RequestInit = {
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        "Content-Type": "application/json",
+      },
+    };
+    if (revalidateSeconds !== undefined) {
+      (fetchOpts as Record<string, unknown>).next = {
+        revalidate: revalidateSeconds,
+      };
+    }
+
+    const res = await fetch(url, fetchOpts);
+
+    if (res.ok) return res.json() as Promise<T>;
+
+    if (res.status === 429 && attempt < maxRetries) {
+      const backoff = Math.pow(2, attempt + 1) * 1000; // 2s, 4s, 8s
+      console.warn(
+        `[uptime-robot] 429 on ${url.split("?")[0].split("/v3")[1]}, ` +
+          `retry in ${backoff / 1000}s (${attempt + 1}/${maxRetries})`,
+      );
+      await delay(backoff);
+      continue;
+    }
+
+    const body = await res.text().catch(() => "");
+    throw new Error(
+      `${res.status}${body ? ` - ${body.slice(0, 200)}` : ""}`,
+    );
+  }
+  throw new Error("Max retries exceeded");
+}
 
 /** 获取全量 monitor 列表 */
 async function fetchMonitorList(jwt: string): Promise<V3MonitorListItem[]> {
-  const res = await fetch(`${API_BASE}/monitors?limit=200`, {
-    headers: {
-      Authorization: `Bearer ${jwt}`,
-      "Content-Type": "application/json",
-    },
-    next: { revalidate: 30 },
-  });
-
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new Error(
-      `Monitor list error ${res.status}${body ? ` - ${body.slice(0, 200)}` : ""}`,
-    );
-  }
-
-  const json = await res.json();
+  const json = await v3Fetch<{ nextLink: string | null; data: V3MonitorListItem[] }>(
+    `${API_BASE}/monitors?limit=200`,
+    jwt,
+    30,
+  );
   return json.data ?? [];
 }
 
-/** 获取过去 90 天的全部 incidents */
+/** 获取过去 90 天的全部 incidents（v3 无 limit 参数，依赖默认分页） */
 async function fetchAllIncidents(jwt: string): Promise<V3IncidentItem[]> {
-  const params = new URLSearchParams({
-    started_after: daysAgoISO(90),
-    limit: "500",
-  });
+  const url = `${API_BASE}/incidents?started_after=${encodeURIComponent(daysAgoISO(90))}`;
+  const json = await v3Fetch<{ nextLink: string | null; data: V3IncidentItem[] }>(
+    url,
+    jwt,
+    60,
+  );
 
-  const res = await fetch(`${API_BASE}/incidents?${params}`, {
-    headers: {
-      Authorization: `Bearer ${jwt}`,
-      "Content-Type": "application/json",
-    },
-    next: { revalidate: 60 },
-  });
+  const all = [...(json.data ?? [])];
 
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new Error(
-      `Incidents error ${res.status}${body ? ` - ${body.slice(0, 200)}` : ""}`,
+  // 如果分页未结束，继续拉取（最多额外 2 页，避免过多调用）
+  let nextUrl = json.nextLink;
+  let extraPages = 0;
+  while (nextUrl && extraPages < 2) {
+    await delay(1000); // 翻页间隔
+    const page = await v3Fetch<{ nextLink: string | null; data: V3IncidentItem[] }>(
+      nextUrl,
+      jwt,
     );
+    all.push(...(page.data ?? []));
+    nextUrl = page.nextLink;
+    extraPages++;
   }
 
-  const json = await res.json();
-  return json.data ?? [];
+  return all;
 }
 
-/** 获取单个 monitor 的响应时间（仅响应时间缓存过期时调用） */
+/** 获取单个 monitor 的响应时间 */
 async function fetchOneResponseTime(
   jwt: string,
   monitorId: number,
@@ -165,20 +204,10 @@ async function fetchOneResponseTime(
     to: new Date().toISOString(),
     includeTimeSeries: "true",
   });
-
-  const res = await fetch(
+  return v3Fetch<V3ResponseTimeStats>(
     `${API_BASE}/monitors/${monitorId}/stats/response-time?${params}`,
-    { headers: { Authorization: `Bearer ${jwt}` } },
+    jwt,
   );
-
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new Error(
-      `Response time error ${res.status}${body ? ` - ${body.slice(0, 200)}` : ""}`,
-    );
-  }
-
-  return res.json();
 }
 
 // ============================================================
