@@ -28,7 +28,159 @@ const RT_REVALIDATE = 30 * 60; // 30 分钟
 // 实际策略：每次请求最多发 1 个 RT 请求，30s 轮询 = 2 RT/min + 2 base/min = 4-6 req/min，远低于上限。
 
 // ============================================================
-// 工具函数
+// 全局速率门（FREE plan: 10 req/min 账户级，跨实例需要共享视角）
+// ============================================================
+
+/**
+ * UptimeRobot v3 限流是账户级（不是 IP 级、也不是端点级）。
+ * 多 serverless 实例并发会把 10/min 配额打爆。
+ *
+ * 策略：
+ *   1. 进程内滑动窗口记录最近 60s 发出的请求时间戳（本地视角下界）
+ *   2. 用响应里的 X-RateLimit-Remaining / X-RateLimit-Reset 校准（账户级真实值）
+ *   3. 取两者更保守的，发请求前判断；不够就让非关键请求让步
+ *   4. 429 优先用 Retry-After header（一般 5-10s），不再瞎用 20-40s 退避
+ */
+
+const RATE_WINDOW_MS = 60_000;
+const RATE_LIMIT = 10;
+
+let rateChainTail: Promise<unknown> = Promise.resolve();
+
+interface RateState {
+  /** 最近 60s 内本实例发出的请求时间戳（本地下界视角） */
+  localStamps: number[];
+  /** 来自上一次响应头的真实剩余值（账户级，跨实例共享视角） */
+  serverRemaining: number | null;
+  /** 上一次响应头记录时间，用于判断 serverRemaining 是否还新鲜 */
+  serverStampedAt: number;
+  /** Retry-After 给出的不可发请求的最早时间戳 */
+  blockedUntil: number;
+}
+
+function getRateState(): RateState {
+  const g = globalThis as Record<string, unknown>;
+  if (!g.__rateState) {
+    g.__rateState = {
+      localStamps: [],
+      serverRemaining: null,
+      serverStampedAt: 0,
+      blockedUntil: 0,
+    } satisfies RateState;
+  }
+  return g.__rateState as RateState;
+}
+
+function pruneOldStamps(state: RateState, now: number): void {
+  const cutoff = now - RATE_WINDOW_MS;
+  state.localStamps = state.localStamps.filter((t) => t > cutoff);
+}
+
+/**
+ * 估算当前可用配额下界（保守取本地 + 服务端两个视角中的较小者）。
+ * 服务端视角超过 10s 不再可信（多实例可能已经又消费了），按本地估算。
+ */
+function estimateAvailable(): number {
+  const state = getRateState();
+  const now = Date.now();
+  pruneOldStamps(state, now);
+
+  const localUsed = state.localStamps.length;
+  const localAvailable = Math.max(0, RATE_LIMIT - localUsed);
+
+  let serverAvailable = Infinity;
+  if (
+    state.serverRemaining !== null &&
+    now - state.serverStampedAt < 10_000
+  ) {
+    serverAvailable = state.serverRemaining;
+  }
+
+  return Math.min(localAvailable, serverAvailable);
+}
+
+function timeUntilAvailable(): number {
+  const state = getRateState();
+  const now = Date.now();
+
+  if (state.blockedUntil > now) {
+    return state.blockedUntil - now;
+  }
+
+  pruneOldStamps(state, now);
+  if (estimateAvailable() > 0) return 0;
+
+  if (state.localStamps.length === 0) return RATE_WINDOW_MS;
+  const earliest = Math.min(...state.localStamps);
+  return Math.max(0, earliest + RATE_WINDOW_MS - now);
+}
+
+interface RateAcquireOptions {
+  critical: boolean;
+  minRemaining?: number;
+}
+
+/**
+ * 申请发起 1 次 v3 请求的资格。critical=true 时阻塞等待；critical=false 配额不足则返回 false。
+ * 通过 rateChainTail 串行化避免并发请求一起穿透速率门。
+ */
+async function acquireRate(opts: RateAcquireOptions): Promise<boolean> {
+  const ticket = rateChainTail.then(async () => {
+    const state = getRateState();
+
+    while (true) {
+      const waitMs = timeUntilAvailable();
+      if (waitMs === 0) break;
+
+      if (!opts.critical) {
+        return false;
+      }
+      await delay(Math.min(waitMs, 5_000));
+    }
+
+    const minRemaining = opts.minRemaining ?? 0;
+    if (!opts.critical && estimateAvailable() <= minRemaining) {
+      return false;
+    }
+
+    state.localStamps.push(Date.now());
+    return true;
+  });
+
+  rateChainTail = ticket.then(
+    () => undefined,
+    () => undefined,
+  );
+  return ticket;
+}
+
+function ingestRateHeaders(res: Response): void {
+  const state = getRateState();
+
+  const remaining = res.headers.get("x-ratelimit-remaining");
+  if (remaining !== null) {
+    const n = parseInt(remaining, 10);
+    if (!isNaN(n)) {
+      state.serverRemaining = n;
+      state.serverStampedAt = Date.now();
+    }
+  }
+
+  if (res.status === 429) {
+    const retryAfter = res.headers.get("retry-after");
+    let waitSec = 10;
+    if (retryAfter) {
+      const n = parseInt(retryAfter, 10);
+      if (!isNaN(n) && n > 0) waitSec = Math.min(n, 60);
+    }
+    state.blockedUntil = Date.now() + waitSec * 1000;
+    state.serverRemaining = 0;
+    state.serverStampedAt = Date.now();
+  }
+}
+
+// ============================================================
+// 工具函数 — 通用 helper
 // ============================================================
 
 function toNum(val: unknown, fallback = 0): number {
@@ -117,21 +269,41 @@ function isStale(entry: CacheEntry<unknown> | null, ttlMs: number): boolean {
 }
 
 // ============================================================
-// v3 API 调用（带 Next Data Cache + 429 重试）
+// v3 API 调用（速率门 + Retry-After + Next Data Cache）
 // ============================================================
 
+class RateLimitedError extends Error {
+  constructor() {
+    super("RATE_LIMIT_SKIPPED");
+    this.name = "RateLimitedError";
+  }
+}
+
 /**
- * Next.js fetch 自带 Vercel Data Cache：通过 next.revalidate 跨冷启动复用。
- * 第二次冷启动直接命中边缘缓存，绕开 Uptime Robot 的限流和延迟。
+ * v3 请求统一入口。
+ *   - critical=true：base 数据，等到能发为止
+ *   - critical=false：RT 等非关键数据，配额紧张直接抛 RateLimitedError，不发请求
+ *
+ * Next Data Cache（next.revalidate）依然在用：fetch 命中边缘缓存时不会进入这里的速率门。
+ * 但生产环境上 stale 时仍需要打源站，速率门确保打源站的频率受控。
  */
 async function v3Fetch<T>(
   url: string,
   jwt: string,
   revalidate: number,
+  opts: { critical: boolean; minRemaining?: number } = { critical: true },
 ): Promise<T> {
-  const maxRetries = 3;
+  const maxRetries = 2;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const allowed = await acquireRate({
+      critical: opts.critical,
+      minRemaining: opts.minRemaining,
+    });
+    if (!allowed) {
+      throw new RateLimitedError();
+    }
+
     const res = await fetch(url, {
       headers: {
         Authorization: `Bearer ${jwt}`,
@@ -140,15 +312,18 @@ async function v3Fetch<T>(
       next: { revalidate },
     });
 
+    ingestRateHeaders(res);
+
     if (res.ok) return res.json() as Promise<T>;
 
     if (res.status === 429 && attempt < maxRetries) {
-      const backoff = Math.pow(2, attempt + 1) * 5000;
+      // ingestRateHeaders 已经把 blockedUntil 设好了，下一轮 acquireRate 会等 Retry-After
+      const endpoint = url.split("?")[0].split("/v3")[1];
       console.warn(
-        `[uptime-robot] 429 on ${url.split("?")[0].split("/v3")[1]}, ` +
-          `retry in ${backoff / 1000}s (${attempt + 1}/${maxRetries})`,
+        `[uptime-robot] 429 on ${endpoint}, will honor Retry-After`,
       );
-      await delay(backoff);
+      // 非关键请求 429 后直接放弃，不浪费下一次配额
+      if (!opts.critical) throw new RateLimitedError();
       continue;
     }
 
@@ -165,6 +340,7 @@ async function fetchMonitorList(jwt: string): Promise<V3MonitorListItem[]> {
     `${API_BASE}/monitors?limit=200`,
     jwt,
     BASE_REVALIDATE,
+    { critical: true },
   );
   return json.data ?? [];
 }
@@ -175,6 +351,7 @@ async function fetchAllIncidents(jwt: string): Promise<V3IncidentItem[]> {
     url,
     jwt,
     BASE_REVALIDATE,
+    { critical: true },
   );
 
   const all = [...(json.data ?? [])];
@@ -182,15 +359,21 @@ async function fetchAllIncidents(jwt: string): Promise<V3IncidentItem[]> {
   let nextUrl = json.nextLink;
   let extraPages = 0;
   while (nextUrl && extraPages < 2) {
-    await delay(1000);
-    const page = await v3Fetch<{ nextLink: string | null; data: V3IncidentItem[] }>(
-      nextUrl,
-      jwt,
-      BASE_REVALIDATE,
-    );
-    all.push(...(page.data ?? []));
-    nextUrl = page.nextLink;
-    extraPages++;
+    // 分页本身不算关键 — 第一页通常已覆盖近期事件，配额紧张时跳过
+    try {
+      const page = await v3Fetch<{ nextLink: string | null; data: V3IncidentItem[] }>(
+        nextUrl,
+        jwt,
+        BASE_REVALIDATE,
+        { critical: false, minRemaining: 3 },
+      );
+      all.push(...(page.data ?? []));
+      nextUrl = page.nextLink;
+      extraPages++;
+    } catch (e) {
+      if (e instanceof RateLimitedError) break;
+      throw e;
+    }
   }
 
   return all;
@@ -205,10 +388,12 @@ async function fetchOneResponseTime(
     to: new Date().toISOString(),
     includeTimeSeries: "true",
   });
+  // RT 永远是非关键 — 配额不足时让位给 base
   return v3Fetch<V3ResponseTimeStats>(
     `${API_BASE}/monitors/${monitorId}/stats/response-time?${params}`,
     jwt,
     RT_REVALIDATE,
+    { critical: false, minRemaining: 3 },
   );
 }
 
@@ -228,14 +413,11 @@ const MONITORS_TTL = 30 * 60 * 1000;
 
 /**
  * 缓存策略：
- *   FRESH (< 30 min)：直接返，但若有 monitor 还缺 RT，阻塞补 1 个
- *   STALE (30-90 min)：返旧数据 + 后台刷新；若有 RT 缺失也阻塞补 1 个
- *   COLD (> 90 min / 冷启动)：阻塞拉取（monitors+incidents 并行 + 1 个 RT），最坏 ~500-700ms
+ *   FRESH (< 30 min)：直接返；RT 仅在配额充足时尝试补 1 个（非关键）
+ *   STALE (30-90 min)：返旧数据 + 后台刷新；不补 RT（base 才是优先级）
+ *   COLD (> 90 min / 冷启动)：阻塞拉取 base，配额允许时再补 1 个 RT
  *
- * 关键设计：RT 改为"每次请求阻塞拉 1 个最缺的"。
- *   - Vercel serverless 函数返回后会冻结，fire-and-forget 不可靠
- *   - 30s 客户端轮询 = 每分钟 2 次，N 个 monitor 在 N×30s 内全部填满
- *   - 限流：基础 2 + RT 1 = 3 req/请求；30s 内 ≤ 6 req/min，远低于 10/min
+ * 关键变化：RT 现在是"非关键"请求，配额不足时跳过，让位给 base 数据。
  */
 export async function fetchMonitors(
   jwt: string,
@@ -243,7 +425,6 @@ export async function fetchMonitors(
   const entry = cacheGet<FormattedMonitor[]>("monitors");
 
   if (isFresh(entry, MONITORS_TTL) && entry) {
-    // 命中 FRESH 但 RT 可能还没补齐 → 阻塞拉 1 个
     await fetchOneMissingRT(jwt, entry.data);
     cacheSet("monitors", entry.data);
     return entry.data;
@@ -251,8 +432,7 @@ export async function fetchMonitors(
 
   if (isStale(entry, MONITORS_TTL) && entry) {
     refreshInBackground(jwt);
-    await fetchOneMissingRT(jwt, entry.data);
-    cacheSet("monitors", entry.data);
+    // STALE：base 都过期了，不再为 RT 抢配额
     return entry.data;
   }
 
@@ -438,6 +618,10 @@ async function fetchOneMissingRT(
 
     cacheSet("responseTimes", rtCache);
   } catch (e) {
+    if (e instanceof RateLimitedError) {
+      // 配额紧张，让位给 base — 静默跳过，下次请求会再尝试
+      return;
+    }
     console.warn(
       `[uptime-robot] RT fetch failed for ${target.name}:`,
       e instanceof Error ? e.message : e,
