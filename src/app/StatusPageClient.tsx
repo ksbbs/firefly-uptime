@@ -37,7 +37,7 @@ export default function StatusPageClient({ initialData }: Props) {
   }, []);
 
   useEffect(() => {
-    const interval = setInterval(fetchData, 30000);
+    const interval = setInterval(fetchData, 60000);
     return () => clearInterval(interval);
   }, [fetchData]);
 
@@ -80,7 +80,7 @@ export default function StatusPageClient({ initialData }: Props) {
         <div className="flex items-center justify-between animate-fade-in stagger-1">
           <p className="text-text-muted text-xs">
             {data.monitors.length > 0
-              ? `已监控 ${data.monitors.length} 个服务 · 每 30 秒自动刷新`
+              ? `已监控 ${data.monitors.length} 个服务 · 每 60 秒自动刷新`
               : "暂无监控项"}
           </p>
           <button
