@@ -25,9 +25,7 @@ const BASE_REVALIDATE = 60; // 60s
 const RT_REVALIDATE = 30 * 60; // 30 分钟
 
 // FREE plan 限制：10 req/min（滚动窗口）。
-// 冷启动峰值：2 base（并行）+ N RT（间隔 8s）。
-// 60s 内最多：2 + 7 = 9 次，留 1 次余量。
-const RT_INTERVAL_MS = 8000;
+// 实际策略：每次请求最多发 1 个 RT 请求，30s 轮询 = 2 RT/min + 2 base/min = 4-6 req/min，远低于上限。
 
 // ============================================================
 // 工具函数
@@ -230,11 +228,14 @@ const MONITORS_TTL = 30 * 60 * 1000;
 
 /**
  * 缓存策略：
- *   FRESH (< 30 min)：直接返，零 API 调用
- *   STALE (30-90 min)：返旧数据 + 后台刷新
- *   COLD (> 90 min / 冷启动)：阻塞拉取（仅 monitors+incidents 并行），响应时间异步填充
+ *   FRESH (< 30 min)：直接返，但若有 monitor 还缺 RT，阻塞补 1 个
+ *   STALE (30-90 min)：返旧数据 + 后台刷新；若有 RT 缺失也阻塞补 1 个
+ *   COLD (> 90 min / 冷启动)：阻塞拉取（monitors+incidents 并行 + 1 个 RT），最坏 ~500-700ms
  *
- * 关键变化：响应时间从来不在主路径上阻塞，最坏情况冷启动只等 1 次 API 往返。
+ * 关键设计：RT 改为"每次请求阻塞拉 1 个最缺的"。
+ *   - Vercel serverless 函数返回后会冻结，fire-and-forget 不可靠
+ *   - 30s 客户端轮询 = 每分钟 2 次，N 个 monitor 在 N×30s 内全部填满
+ *   - 限流：基础 2 + RT 1 = 3 req/请求；30s 内 ≤ 6 req/min，远低于 10/min
  */
 export async function fetchMonitors(
   jwt: string,
@@ -242,13 +243,16 @@ export async function fetchMonitors(
   const entry = cacheGet<FormattedMonitor[]>("monitors");
 
   if (isFresh(entry, MONITORS_TTL) && entry) {
-    fillResponseTimesAsync(jwt, entry.data);
+    // 命中 FRESH 但 RT 可能还没补齐 → 阻塞拉 1 个
+    await fetchOneMissingRT(jwt, entry.data);
+    cacheSet("monitors", entry.data);
     return entry.data;
   }
 
   if (isStale(entry, MONITORS_TTL) && entry) {
     refreshInBackground(jwt);
-    fillResponseTimesAsync(jwt, entry.data);
+    await fetchOneMissingRT(jwt, entry.data);
+    cacheSet("monitors", entry.data);
     return entry.data;
   }
 
@@ -267,7 +271,7 @@ export async function fetchMonitors(
   }
 }
 
-/** 冷启动只跑这条路径：基础数据并行 → 用 RT 缓存即时填充 → 后台异步补未命中 */
+/** 冷启动主路径：基础数据并行 → 用 RT 缓存即时填充 → 阻塞补 1 个最缺的 RT */
 async function doFetchMonitors(jwt: string): Promise<FormattedMonitor[]> {
   // monitors + incidents 并行（Next Data Cache 命中时几乎零延迟，未命中也只等最慢的一个）
   const [monitorItems, allIncidents] = await Promise.all([
@@ -319,10 +323,11 @@ async function doFetchMonitors(jwt: string): Promise<FormattedMonitor[]> {
   // 用 RT 缓存做即时填充（不发请求）
   hydrateResponseTimesFromCache(monitors);
 
-  cacheSet("monitors", monitors);
+  // 阻塞拉 1 个最缺/最旧的 RT，确保数据真的能进缓存
+  // （Vercel serverless 函数返回后会冻结，fire-and-forget 不可靠）
+  await fetchOneMissingRT(jwt, monitors);
 
-  // 缺失的 RT 后台异步拉，绝不阻塞首屏
-  fillResponseTimesAsync(jwt, monitors);
+  cacheSet("monitors", monitors);
 
   return monitors;
 }
@@ -341,17 +346,19 @@ async function refreshInBackground(jwt: string): Promise<void> {
 }
 
 // ============================================================
-// 响应时间（独立缓存 + 完全异步）
+// 响应时间（独立缓存 + 阻塞补一个最旧的）
 // ============================================================
 
 const RT_TTL = 120 * 60 * 1000;
+const RT_FRESH_TTL = 30 * 60 * 1000; // RT 数据 30 分钟内视为新鲜
 
 interface CachedRT {
   responseTimes: { datetime: number; value: number }[];
   averageResponseTime: number;
+  fetchedAt: number; // 用于"最旧优先"轮换刷新
 }
 
-/** 同步：从缓存填充，不发请求。供冷启动主路径调用。 */
+/** 同步：从缓存填充，不发请求。供主路径调用。 */
 function hydrateResponseTimesFromCache(monitors: FormattedMonitor[]): void {
   const rtEntry = cacheGet<Record<number, CachedRT>>("responseTimes");
   if (!isStale(rtEntry, RT_TTL) || !rtEntry) return;
@@ -365,65 +372,82 @@ function hydrateResponseTimesFromCache(monitors: FormattedMonitor[]): void {
   }
 }
 
-let rtRefreshRunning = false;
-
 /**
- * 后台拉取响应时间。串行 + 7s 间隔（≈8.5 req/min，FREE plan 10 req/min 内）。
- * 永远不要 await 这个函数——它是 fire-and-forget，下一次轮询自然会拿到新数据。
+ * 阻塞拉取 1 个 RT 数据（最多）。优先级：
+ *   1. 没有 RT 缓存的 monitor（首次填充）
+ *   2. 缓存最旧的 monitor（轮换刷新）
+ *
+ * 仅在以下场景跳过：
+ *   - 全部 monitor 都有 RT 且都在 RT_FRESH_TTL 内
+ *   - rtRefreshRunning 锁占用（同一 warm instance 内已有 RT 请求在飞）
+ *
+ * 失败容忍：单个 RT 失败时不抛错，只 warn，让基础数据正常返回。
  */
-async function fillResponseTimesAsync(
+async function fetchOneMissingRT(
   jwt: string,
   monitors: FormattedMonitor[],
 ): Promise<void> {
+  if (monitors.length === 0) return;
   if (rtRefreshRunning) return;
-  rtRefreshRunning = true;
 
-  try {
-    const rtEntry = cacheGet<Record<number, CachedRT>>("responseTimes");
-    const isCacheFresh = isFresh(rtEntry, RT_TTL);
+  const rtEntry = cacheGet<Record<number, CachedRT>>("responseTimes");
+  const rtCache: Record<number, CachedRT> =
+    isStale(rtEntry, RT_TTL) && rtEntry ? { ...rtEntry.data } : {};
 
-    const rtCache: Record<number, CachedRT> =
-      isStale(rtEntry, RT_TTL) && rtEntry ? { ...rtEntry.data } : {};
+  // 1. 找无缓存的 monitor
+  const missing = monitors.find((m) => !rtCache[m.id]);
+  let target: FormattedMonitor | undefined = missing;
 
-    // 全部命中且新鲜 → 不发请求
-    const missing = monitors.filter((m) => !rtCache[m.id]);
-    if (missing.length === 0 && isCacheFresh) return;
-
-    // 全部命中但已过 FRESH → 后台轮换更新（每次只拉一个最旧的，避免堆积）
-    const targets = missing.length > 0 ? missing : monitors.slice(0, 1);
-
-    for (const mon of targets) {
-      try {
-        const rt = await fetchOneResponseTime(jwt, mon.id);
-        const tsData = rt.time_series || [];
-        const data: CachedRT = {
-          responseTimes: tsData.map((ts, idx) => ({
-            datetime: ts.datetime
-              ? isoToUnix(ts.datetime)
-              : Math.floor(Date.now() / 1000) - (tsData.length - 1 - idx) * 300,
-            value: toNum(ts.value),
-          })),
-          averageResponseTime: Math.round(rt.summary.avg),
-        };
-        rtCache[mon.id] = data;
-        // 同时更新当前 monitors 数组（同一对象被 cacheSet 引用，下次 FRESH 命中时已带 RT）
-        mon.responseTimes = data.responseTimes;
-        mon.averageResponseTime = data.averageResponseTime;
-      } catch (e) {
-        console.warn(
-          `[uptime-robot] RT fetch failed for ${mon.name}:`,
-          e instanceof Error ? e.message : e,
-        );
+  // 2. 没有缺失 → 找缓存最旧的（且已过 FRESH 阈值）
+  if (!target) {
+    let oldestAge = -1;
+    const now = Date.now();
+    for (const mon of monitors) {
+      const cached = rtCache[mon.id];
+      if (!cached) continue;
+      const age = now - cached.fetchedAt;
+      if (age > RT_FRESH_TTL && age > oldestAge) {
+        oldestAge = age;
+        target = mon;
       }
-
-      await delay(RT_INTERVAL_MS);
     }
+  }
+
+  // 全部 fresh → 不发请求
+  if (!target) return;
+
+  rtRefreshRunning = true;
+  try {
+    const rt = await fetchOneResponseTime(jwt, target.id);
+    const tsData = rt.time_series || [];
+    const data: CachedRT = {
+      responseTimes: tsData.map((ts, idx) => ({
+        datetime: ts.datetime
+          ? isoToUnix(ts.datetime)
+          : Math.floor(Date.now() / 1000) - (tsData.length - 1 - idx) * 300,
+        value: toNum(ts.value),
+      })),
+      averageResponseTime: Math.round(rt.summary.avg),
+      fetchedAt: Date.now(),
+    };
+    rtCache[target.id] = data;
+
+    // 同步更新当前 monitors 数组（同对象会被 cacheSet 引用）
+    target.responseTimes = data.responseTimes;
+    target.averageResponseTime = data.averageResponseTime;
 
     cacheSet("responseTimes", rtCache);
+  } catch (e) {
+    console.warn(
+      `[uptime-robot] RT fetch failed for ${target.name}:`,
+      e instanceof Error ? e.message : e,
+    );
   } finally {
     rtRefreshRunning = false;
   }
 }
+
+let rtRefreshRunning = false;
 
 // ============================================================
 // 工具函数
