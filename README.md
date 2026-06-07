@@ -67,10 +67,11 @@ npm run dev
 ```
 src/
 ├── app/
-│   ├── api/monitors/route.ts    # API 代理路由（v3 JWT）
+│   ├── api/monitors/route.ts    # API 代理路由（v3 JWT，30s polling 复用）
 │   ├── globals.css              # 全局样式 + Tailwind + 动画
 │   ├── layout.tsx               # 根布局
-│   └── page.tsx                 # 主页面
+│   ├── page.tsx                 # 主页面（async server component, ISR 30s）
+│   └── StatusPageClient.tsx     # 客户端交互层（轮询 / 搜索 / 筛选 / 弹窗）
 ├── components/
 │   ├── IncidentTimeline.tsx     # 事件时间线
 │   ├── MiniHistoryBar.tsx       # 迷你历史趋势条
@@ -80,8 +81,9 @@ src/
 │   ├── SearchFilter.tsx         # 搜索和筛选
 │   └── StatusHeader.tsx         # 状态头部汇总
 └── lib/
+    ├── status-page.ts           # SSR/路由共用的数据封装 + sanitize
     ├── types.ts                 # 类型定义 + v3 状态映射
-    └── uptime-robot.ts          # v3 REST API 客户端
+    └── uptime-robot.ts          # v3 REST API 客户端 + 三级缓存
 ```
 
 ## API 版本说明
@@ -90,12 +92,21 @@ src/
 
 - **Base URL**: `https://api.uptimerobot.com/v3`
 - **认证**: `Authorization: Bearer <JWT>`
-- **端点**:
+- **端点**（只用 2 个）:
   - `GET /monitors` — monitor 列表
-  - `GET /monitors/{id}/stats/uptime` — uptime 统计（7d/30d/90d）
-  - `GET /monitors/{id}/stats/response-time` — 响应时间数据
-  - `GET /incidents` — 宕机事件
-- **缓存**: 服务端 ISR 30 秒，CDN 缓存
+  - `GET /incidents` — 宕机事件（uptime 比率从 incidents 本地计算，不再调 stats/uptime）
+  - `GET /monitors/{id}/stats/response-time` — 响应时间数据（独立缓存，后台异步拉取）
+- **限流**: FREE plan 10 req/min。冷启动峰值 ≤ 9 req/min，留出余量。
+
+## 性能优化
+
+冷启动首屏 ≤ 1s 的关键设计：
+
+- **SSR + ISR**：`page.tsx` 是 server component，HTML 直接带初始数据下发，省一个客户端往返。`revalidate = 30` 配合 Vercel 边缘缓存。
+- **基础数据并行**：`/monitors` 和 `/incidents` 用 `Promise.all` 同时拉，省掉之前的 1s 串行间隔。
+- **响应时间永不阻塞**：冷启动只用 RT 的 globalThis 缓存即时填充，未命中部分以 8s 间隔在后台串行补拉，不挡首屏。
+- **Next Data Cache**：`fetch` 加 `next: { revalidate }`，跨 serverless 冷启动复用边缘缓存，二次冷启动几乎零外部 API 调用。
+- **三级缓存**（globalThis warm instance 内）：FRESH < 30 min 直接返；STALE 30–90 min 返旧 + 后台刷新；COLD 阻塞拉取并通过 `inflightPromise` 去重并发。
 
 ## 许可证
 
